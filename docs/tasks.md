@@ -101,10 +101,10 @@
 - **Files**: `src/scalar/optimizer.rs` (new), `src/scalar/mod.rs`
 - **Tests**: AdamW converges faster than SGD on same dataset; momentum/variance state updates correctly
 - **Done when**: Scalar training with AdamW shows improved convergence curve
-- [ ] Write convergence comparison test (SGD vs AdamW)
-- [ ] Implement AdamW struct with step()
-- [ ] Wire into scalar training loop (optional flag)
-- [ ] Implement and verify
+- [x] Write convergence comparison test (SGD vs AdamW)
+- [x] Implement AdamW struct with step()
+- [x] Wire into scalar training loop (optional flag)
+- [x] Implement and verify
 
 ### 4.2: Add learning rate schedule [FR-010]
 - **What**: Implement warmup + cosine decay schedule matching upstream

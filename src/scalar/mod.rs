@@ -1,5 +1,6 @@
 mod bigram;
 mod minigpt;
+mod optimizer;
 pub mod value;
 
 use std::fmt;
@@ -8,13 +9,15 @@ use std::time::Instant;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::config::{ModelKind, SampleConfig, Style, TrainConfig};
+use crate::config::{ModelKind, Optimizer, SampleConfig, Style, TrainConfig};
 use crate::data::{self, TokenizerError};
 use crate::eval::EvalGuardError;
 
 use self::bigram::{ScalarBigram, build_transition_counts, sample_index};
+use self::optimizer::{AdamW, AdamWConfig};
 
 const DEFAULT_LEARNING_RATE: f64 = 0.1;
+const ADAMW_LEARNING_RATE: f64 = 0.03;
 const LOSS_WINDOW: usize = 50;
 pub(super) const VAL_FRACTION: f32 = 0.1;
 const EVAL_EVERY: usize = 20;
@@ -121,6 +124,7 @@ pub fn train(config: &TrainConfig) -> Result<TrainMetrics, ScalarError> {
             &base_text,
             config.steps,
             config.seed,
+            config.optimizer,
             config.style,
             config.tie_lm_head,
             config.input_rmsnorm,
@@ -129,6 +133,7 @@ pub fn train(config: &TrainConfig) -> Result<TrainMetrics, ScalarError> {
             &base_text,
             config.steps,
             config.seed,
+            config.optimizer,
             config.style,
             config.tie_lm_head,
             config.input_rmsnorm,
@@ -169,6 +174,7 @@ fn train_from_text(
     text: &str,
     steps: usize,
     seed: u64,
+    optimizer: Optimizer,
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
@@ -181,6 +187,8 @@ fn train_from_text(
     let mut model = ScalarBigram::new(tokenizer.vocab_size(), seed, tie_lm_head, input_rmsnorm);
     let parameters = model.parameters();
     let mut rng = StdRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15);
+    let mut adamw =
+        matches!(optimizer, Optimizer::AdamW).then(|| AdamW::new(AdamWConfig::default()));
 
     let mut losses = Vec::with_capacity(steps.max(1));
     let mut val_loss = Some(mean_nll_loss(&model, eval_pairs_slice(&val_pairs)));
@@ -192,7 +200,18 @@ fn train_from_text(
         for step in 0..steps {
             let pair_idx = rng.gen_range(0..train_pairs.len());
             let (context_id, target_id) = train_pairs[pair_idx];
-            let loss = model.train_step(context_id, target_id, DEFAULT_LEARNING_RATE, &parameters);
+            let loss = if let Some(opt) = adamw.as_mut() {
+                for parameter in &parameters {
+                    parameter.zero_grad();
+                }
+                let loss_node = model.nll_loss(context_id, target_id);
+                let loss = loss_node.data();
+                loss_node.backward();
+                opt.step(&parameters, ADAMW_LEARNING_RATE);
+                loss
+            } else {
+                model.train_step(context_id, target_id, DEFAULT_LEARNING_RATE, &parameters)
+            };
             losses.push(loss);
             let step_idx = step + 1;
             if should_eval(step_idx, steps, EVAL_EVERY) {
@@ -366,16 +385,32 @@ fn build_pairs(token_ids: &[usize]) -> Result<Vec<TokenPair>, ScalarError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::Style;
+    use crate::config::{Optimizer, Style};
 
     use super::{ScalarError, sample_from_text, train_from_text};
 
     #[test]
     fn train_loss_drops_on_repetitive_text() {
-        let baseline = train_from_text("abababababababab", 0, 42, Style::Classic, true, false)
-            .expect("baseline metrics");
-        let trained = train_from_text("abababababababab", 400, 42, Style::Classic, true, false)
-            .expect("trained metrics");
+        let baseline = train_from_text(
+            "abababababababab",
+            0,
+            42,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            false,
+        )
+        .expect("baseline metrics");
+        let trained = train_from_text(
+            "abababababababab",
+            400,
+            42,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            false,
+        )
+        .expect("trained metrics");
 
         assert!(trained.mean_loss_last_n < baseline.final_loss);
         assert!(trained.final_loss.is_finite());
@@ -401,8 +436,8 @@ mod tests {
 
     #[test]
     fn empty_input_errors() {
-        let err =
-            train_from_text("", 1, 0, Style::Classic, true, false).expect_err("empty dataset");
+        let err = train_from_text("", 1, 0, Optimizer::Sgd, Style::Classic, true, false)
+            .expect_err("empty dataset");
         match err {
             ScalarError::EmptyDataset => {}
             _ => panic!("unexpected error type"),
@@ -421,17 +456,34 @@ mod tests {
 
     #[test]
     fn untied_metrics_report_more_parameters() {
-        let tied = train_from_text("abababababababab", 0, 7, Style::Classic, true, false)
-            .expect("tied metrics");
-        let untied = train_from_text("abababababababab", 0, 7, Style::Classic, false, false)
-            .expect("untied metrics");
+        let tied = train_from_text(
+            "abababababababab",
+            0,
+            7,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            false,
+        )
+        .expect("tied metrics");
+        let untied = train_from_text(
+            "abababababababab",
+            0,
+            7,
+            Optimizer::Sgd,
+            Style::Classic,
+            false,
+            false,
+        )
+        .expect("untied metrics");
         assert!(untied.parameter_count > tied.parameter_count);
     }
 
     #[test]
     fn train_uses_split_and_reports_validation_loss() {
         let text = "abcdefghijklmnopqrstuvwxyz";
-        let metrics = train_from_text(text, 5, 31, Style::Classic, true, false).expect("metrics");
+        let metrics = train_from_text(text, 5, 31, Optimizer::Sgd, Style::Classic, true, false)
+            .expect("metrics");
 
         let tokenizer = crate::data::Tokenizer::from_text(text);
         let token_ids = tokenizer
@@ -450,6 +502,37 @@ mod tests {
         assert!(
             metrics.val_loss.expect("val loss exists").is_finite(),
             "validation loss should be finite"
+        );
+    }
+
+    #[test]
+    fn adamw_converges_faster_than_sgd_on_repetitive_text() {
+        let sgd = train_from_text(
+            "abababababababab",
+            200,
+            11,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            false,
+        )
+        .expect("sgd metrics");
+        let adamw = train_from_text(
+            "abababababababab",
+            200,
+            11,
+            Optimizer::AdamW,
+            Style::Classic,
+            true,
+            false,
+        )
+        .expect("adamw metrics");
+
+        assert!(
+            adamw.mean_loss_last_n < sgd.mean_loss_last_n,
+            "expected adamw ({}) to beat sgd ({})",
+            adamw.mean_loss_last_n,
+            sgd.mean_loss_last_n
         );
     }
 }

@@ -46,10 +46,26 @@ impl fmt::Display for Style {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Optimizer {
+    Sgd,
+    AdamW,
+}
+
+impl fmt::Display for Optimizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sgd => write!(f, "sgd"),
+            Self::AdamW => write!(f, "adamw"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrainConfig {
     pub mode: Mode,
     pub model_kind: ModelKind,
+    pub optimizer: Optimizer,
     pub style: Style,
     pub tie_lm_head: bool,
     pub input_rmsnorm: bool,

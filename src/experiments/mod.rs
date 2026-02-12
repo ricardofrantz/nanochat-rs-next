@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::{AblateConfig, Mode, ModelKind, TrainConfig};
+use crate::config::{AblateConfig, Mode, ModelKind, Optimizer, TrainConfig};
 use crate::scalar::{self, TrainMetrics};
 
 #[derive(Debug, Clone, Copy)]
@@ -190,6 +190,7 @@ pub fn run_ablation(config: &AblateConfig) -> Result<AblationReport, AblationErr
         let train_config = TrainConfig {
             mode: Mode::Scalar,
             model_kind: ModelKind::Bigram,
+            optimizer: Optimizer::Sgd,
             style: config.style,
             tie_lm_head: variant.tie_lm_head,
             input_rmsnorm: variant.input_rmsnorm,

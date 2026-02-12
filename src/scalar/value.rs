@@ -164,6 +164,10 @@ impl Value {
     fn node_id(&self) -> usize {
         Rc::as_ptr(&self.0) as usize
     }
+
+    pub(crate) fn id(&self) -> usize {
+        self.node_id()
+    }
 }
 
 fn add_grad(value: &Value, delta: f64) {

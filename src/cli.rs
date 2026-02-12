@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::config::{AblateConfig, AppCommand, Mode, ModelKind, SampleConfig, Style, TrainConfig};
+use crate::config::{
+    AblateConfig, AppCommand, Mode, ModelKind, Optimizer, SampleConfig, Style, TrainConfig,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -41,6 +43,13 @@ enum CliStyle {
     Futuristic,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliOptimizer {
+    Sgd,
+    #[value(name = "adamw", alias = "adam-w")]
+    AdamW,
+}
+
 impl From<CliMode> for Mode {
     fn from(mode: CliMode) -> Self {
         match mode {
@@ -68,12 +77,23 @@ impl From<CliStyle> for Style {
     }
 }
 
+impl From<CliOptimizer> for Optimizer {
+    fn from(optimizer: CliOptimizer) -> Self {
+        match optimizer {
+            CliOptimizer::Sgd => Self::Sgd,
+            CliOptimizer::AdamW => Self::AdamW,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct TrainArgs {
     #[arg(long, value_enum, default_value_t = CliMode::Scalar)]
     mode: CliMode,
     #[arg(long, value_enum, default_value_t = CliModelKind::Bigram)]
     model_kind: CliModelKind,
+    #[arg(long, value_enum, default_value_t = CliOptimizer::Sgd)]
+    optimizer: CliOptimizer,
     #[arg(long, value_enum, default_value_t = CliStyle::Futuristic)]
     style: CliStyle,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -142,6 +162,7 @@ fn from_cli(cli: Cli) -> AppCommand {
         CliCommand::Train(args) => AppCommand::Train(TrainConfig {
             mode: args.mode.into(),
             model_kind: args.model_kind.into(),
+            optimizer: args.optimizer.into(),
             style: args.style.into(),
             tie_lm_head: args.tie_lm_head,
             input_rmsnorm: args.input_rmsnorm,
@@ -185,6 +206,7 @@ mod tests {
 
         assert_eq!(config.mode, Mode::Scalar);
         assert_eq!(config.model_kind, ModelKind::Bigram);
+        assert_eq!(config.optimizer, Optimizer::Sgd);
         assert_eq!(config.style, Style::Futuristic);
         assert!(config.tie_lm_head);
         assert!(!config.input_rmsnorm);
@@ -202,6 +224,8 @@ mod tests {
             "train",
             "--tie-lm-head=false",
             "--input-rmsnorm=true",
+            "--optimizer",
+            "adamw",
         ])
         .expect("valid train command");
         let AppCommand::Train(config) = command else {
@@ -210,6 +234,7 @@ mod tests {
 
         assert!(!config.tie_lm_head);
         assert!(config.input_rmsnorm);
+        assert_eq!(config.optimizer, Optimizer::AdamW);
     }
 
     #[test]

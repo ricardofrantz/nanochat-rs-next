@@ -3,10 +3,11 @@ use std::time::Instant;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::config::{ModelKind, Style};
+use crate::config::{ModelKind, Optimizer, Style};
 use crate::data::{self, Tokenizer, TokenizerError};
 use crate::eval::validate_prompt_length;
 
+use super::optimizer::{AdamW, AdamWConfig};
 use super::value::Value;
 use super::{ScalarError, TrainMetrics, VAL_FRACTION, build_pairs, should_eval, styled_corpus};
 
@@ -20,6 +21,7 @@ const MINI_GPT_ZERO_STD: f64 = 0.0;
 const MINI_GPT_LOG_EPS: f64 = 1e-12;
 const MINI_GPT_RMS_EPS: f64 = 1e-5;
 const MINI_GPT_LEARNING_RATE: f64 = 0.02;
+const MINI_GPT_ADAMW_LEARNING_RATE: f64 = 0.01;
 const MINI_GPT_LOSS_WINDOW: usize = 50;
 const MINI_GPT_EVAL_EVERY: usize = 20;
 const MINI_GPT_EVAL_WINDOWS: usize = 32;
@@ -28,6 +30,7 @@ pub(super) fn train_from_text(
     text: &str,
     steps: usize,
     seed: u64,
+    optimizer: Optimizer,
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
@@ -41,6 +44,8 @@ pub(super) fn train_from_text(
     let mut model = ScalarMiniGpt::new(tokenizer.vocab_size(), seed, tie_lm_head, input_rmsnorm);
     let parameters = model.parameters();
     let mut rng = StdRng::seed_from_u64(seed ^ 0xA36C_D6F2_15B3_9241);
+    let mut adamw =
+        matches!(optimizer, Optimizer::AdamW).then(|| AdamW::new(AdamWConfig::default()));
 
     let mut losses = Vec::with_capacity(steps.max(1));
     let mut val_loss = Some(mean_window_loss(&mut model, &val_token_ids));
@@ -51,7 +56,18 @@ pub(super) fn train_from_text(
     } else {
         for step in 0..steps {
             let window = select_training_window(&train_token_ids, &mut rng);
-            let loss = model.train_step(window, MINI_GPT_LEARNING_RATE, &parameters);
+            let loss = if let Some(opt) = adamw.as_mut() {
+                for parameter in &parameters {
+                    parameter.zero_grad();
+                }
+                let loss_node = model.loss_for_tokens(window);
+                let loss = loss_node.data();
+                loss_node.backward();
+                opt.step(&parameters, MINI_GPT_ADAMW_LEARNING_RATE);
+                loss
+            } else {
+                model.train_step(window, MINI_GPT_LEARNING_RATE, &parameters)
+            };
             losses.push(loss);
             let step_idx = step + 1;
             if should_eval(step_idx, steps, MINI_GPT_EVAL_EVERY) {
@@ -509,16 +525,32 @@ fn weighted_choice(weights: &[f64], rng: &mut StdRng) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::Style;
+    use crate::config::{Optimizer, Style};
 
     use super::{MINI_GPT_BLOCK_SIZE, ScalarError, sample_from_text, train_from_text};
 
     #[test]
     fn mini_gpt_train_loss_drops_on_repetitive_text() {
-        let baseline = train_from_text("abababababababab", 0, 17, Style::Classic, true, true)
-            .expect("baseline metrics");
-        let trained = train_from_text("abababababababab", 50, 17, Style::Classic, true, true)
-            .expect("trained metrics");
+        let baseline = train_from_text(
+            "abababababababab",
+            0,
+            17,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            true,
+        )
+        .expect("baseline metrics");
+        let trained = train_from_text(
+            "abababababababab",
+            50,
+            17,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            true,
+        )
+        .expect("trained metrics");
 
         assert!(trained.mean_loss_last_n < baseline.final_loss);
         assert!(trained.final_loss.is_finite());
@@ -547,7 +579,8 @@ mod tests {
     #[test]
     fn mini_gpt_reports_validation_loss() {
         let text = "abcdefghijklmnopqrstuvwxyz0123456789";
-        let metrics = train_from_text(text, 5, 19, Style::Classic, true, true).expect("metrics");
+        let metrics = train_from_text(text, 5, 19, Optimizer::Sgd, Style::Classic, true, true)
+            .expect("metrics");
 
         let tokenizer = crate::data::Tokenizer::from_text(text);
         let token_ids = tokenizer
