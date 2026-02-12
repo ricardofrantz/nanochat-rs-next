@@ -33,6 +33,15 @@ quantum couriers sync with neural uplinks at dawn.\n\
 autonomous swarms calibrate reactor lattices in silence.\n\
 synthetic pilots chart wormhole routes beyond saturn.\n";
 
+type TokenPair = (usize, usize);
+type PairSplits = (Vec<TokenPair>, Vec<TokenPair>);
+
+#[derive(Clone, Copy)]
+struct TensorTrainRuntime<'a> {
+    checkpoint_every: usize,
+    checkpoint_dir: &'a Path,
+}
+
 #[derive(Debug, Clone)]
 pub struct TrainMetrics {
     pub style: Style,
@@ -259,8 +268,10 @@ pub fn train(config: &TrainConfig) -> Result<TrainMetrics, TensorError> {
         config.style,
         config.tie_lm_head,
         config.input_rmsnorm,
-        config.checkpoint_every,
-        &config.checkpoint_dir,
+        TensorTrainRuntime {
+            checkpoint_every: config.checkpoint_every,
+            checkpoint_dir: &config.checkpoint_dir,
+        },
     )
 }
 
@@ -292,8 +303,10 @@ fn train_from_text(
         style,
         tie_lm_head,
         input_rmsnorm,
-        0,
-        Path::new("results/checkpoints"),
+        TensorTrainRuntime {
+            checkpoint_every: 0,
+            checkpoint_dir: Path::new("results/checkpoints"),
+        },
     )
 }
 
@@ -304,8 +317,7 @@ fn train_from_text_with_checkpoints(
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
-    checkpoint_every: usize,
-    checkpoint_dir: &Path,
+    runtime: TensorTrainRuntime<'_>,
 ) -> Result<TrainMetrics, TensorError> {
     #[cfg(feature = "tch-backend")]
     {
@@ -316,8 +328,7 @@ fn train_from_text_with_checkpoints(
             style,
             tie_lm_head,
             input_rmsnorm,
-            checkpoint_every,
-            checkpoint_dir,
+            runtime,
         )
     }
     #[cfg(not(feature = "tch-backend"))]
@@ -329,8 +340,7 @@ fn train_from_text_with_checkpoints(
             style,
             tie_lm_head,
             input_rmsnorm,
-            checkpoint_every,
-            checkpoint_dir,
+            runtime,
         )
     }
 }
@@ -342,8 +352,7 @@ fn train_from_text_cpu(
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
-    checkpoint_every: usize,
-    checkpoint_dir: &Path,
+    runtime: TensorTrainRuntime<'_>,
 ) -> Result<TrainMetrics, TensorError> {
     let corpus = styled_corpus(text, style);
     let tokenizer = data::Tokenizer::from_text(&corpus);
@@ -359,8 +368,8 @@ fn train_from_text_cpu(
     if steps == 0 {
         losses.push(mean_nll_loss_cpu(&model, eval_pairs_slice(&train_pairs)));
         maybe_persist_checkpoint(
-            checkpoint_every,
-            checkpoint_dir,
+            runtime.checkpoint_every,
+            runtime.checkpoint_dir,
             "cpu-native",
             0,
             steps,
@@ -379,8 +388,8 @@ fn train_from_text_cpu(
                 val_loss = Some(mean_nll_loss_cpu(&model, eval_pairs_slice(&val_pairs)));
             }
             maybe_persist_checkpoint(
-                checkpoint_every,
-                checkpoint_dir,
+                runtime.checkpoint_every,
+                runtime.checkpoint_dir,
                 "cpu-native",
                 step_idx,
                 steps,
@@ -433,8 +442,7 @@ fn train_from_text_tch(
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
-    checkpoint_every: usize,
-    checkpoint_dir: &Path,
+    runtime: TensorTrainRuntime<'_>,
 ) -> Result<TrainMetrics, TensorError> {
     let corpus = styled_corpus(text, style);
     let tokenizer = data::Tokenizer::from_text(&corpus);
@@ -491,8 +499,8 @@ fn train_from_text_tch(
         );
         losses.push(loss.double_value(&[]));
         maybe_persist_checkpoint(
-            checkpoint_every,
-            checkpoint_dir,
+            runtime.checkpoint_every,
+            runtime.checkpoint_dir,
             "tch",
             0,
             steps,
@@ -533,8 +541,8 @@ fn train_from_text_tch(
                 ));
             }
             maybe_persist_checkpoint(
-                checkpoint_every,
-                checkpoint_dir,
+                runtime.checkpoint_every,
+                runtime.checkpoint_dir,
                 "tch",
                 step_idx,
                 steps,
@@ -865,9 +873,7 @@ fn mean_nll_loss_cpu(model: &TensorBigram, pairs: &[(usize, usize)]) -> f64 {
     total / (pairs.len() as f64)
 }
 
-fn split_train_val_pairs(
-    token_ids: &[usize],
-) -> Result<(Vec<(usize, usize)>, Vec<(usize, usize)>), TensorError> {
+fn split_train_val_pairs(token_ids: &[usize]) -> Result<PairSplits, TensorError> {
     let (train_tokens, val_tokens) = data::split_train_val(token_ids, VAL_FRACTION);
     let train_pairs = match build_pairs(&train_tokens) {
         Ok(pairs) => pairs,
@@ -884,7 +890,7 @@ fn should_eval(step: usize, total_steps: usize, eval_every: usize) -> bool {
     if step == total_steps {
         return true;
     }
-    eval_every > 0 && step % eval_every == 0
+    eval_every > 0 && step.is_multiple_of(eval_every)
 }
 
 fn lr_multiplier(step: usize, total_steps: usize) -> f64 {
@@ -921,7 +927,7 @@ fn should_checkpoint(step: usize, total_steps: usize, checkpoint_every: usize) -
     if step == total_steps {
         return true;
     }
-    checkpoint_every > 0 && step % checkpoint_every == 0
+    checkpoint_every > 0 && step.is_multiple_of(checkpoint_every)
 }
 
 fn maybe_persist_checkpoint(
@@ -953,7 +959,7 @@ fn maybe_persist_checkpoint(
     Ok(())
 }
 
-fn build_pairs(token_ids: &[usize]) -> Result<Vec<(usize, usize)>, TensorError> {
+fn build_pairs(token_ids: &[usize]) -> Result<Vec<TokenPair>, TensorError> {
     if token_ids.len() < 2 {
         return Err(TensorError::EmptyDataset);
     }
@@ -1103,8 +1109,10 @@ mod tests {
             Style::Classic,
             true,
             false,
-            2,
-            &checkpoint_dir,
+            super::TensorTrainRuntime {
+                checkpoint_every: 2,
+                checkpoint_dir: &checkpoint_dir,
+            },
         )
         .expect("training should succeed with checkpoints");
 

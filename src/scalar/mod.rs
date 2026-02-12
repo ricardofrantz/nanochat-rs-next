@@ -25,6 +25,9 @@ quantum couriers sync with neural uplinks at dawn.\n\
 autonomous swarms calibrate reactor lattices in silence.\n\
 synthetic pilots chart wormhole routes beyond saturn.\n";
 
+type TokenPair = (usize, usize);
+type PairSplits = (Vec<TokenPair>, Vec<TokenPair>);
+
 #[derive(Debug, Clone)]
 pub struct TrainMetrics {
     pub model_kind: ModelKind,
@@ -159,7 +162,7 @@ pub(super) fn should_eval(step: usize, total_steps: usize, eval_every: usize) ->
     if step == total_steps {
         return true;
     }
-    eval_every > 0 && step % eval_every == 0
+    eval_every > 0 && step.is_multiple_of(eval_every)
 }
 
 fn train_from_text(
@@ -325,12 +328,12 @@ fn apply_futuristic_boost(
     }
 }
 
-fn eval_pairs_slice(pairs: &[(usize, usize)]) -> &[(usize, usize)] {
+fn eval_pairs_slice(pairs: &[TokenPair]) -> &[TokenPair] {
     let eval_len = pairs.len().min(EVAL_PAIRS);
     &pairs[..eval_len]
 }
 
-fn mean_nll_loss(model: &ScalarBigram, pairs: &[(usize, usize)]) -> f64 {
+fn mean_nll_loss(model: &ScalarBigram, pairs: &[TokenPair]) -> f64 {
     let total = pairs
         .iter()
         .map(|(context_id, target_id)| model.nll_loss(*context_id, *target_id).data())
@@ -338,9 +341,7 @@ fn mean_nll_loss(model: &ScalarBigram, pairs: &[(usize, usize)]) -> f64 {
     total / (pairs.len() as f64)
 }
 
-fn split_train_val_pairs(
-    token_ids: &[usize],
-) -> Result<(Vec<(usize, usize)>, Vec<(usize, usize)>), ScalarError> {
+fn split_train_val_pairs(token_ids: &[usize]) -> Result<PairSplits, ScalarError> {
     let (train_tokens, val_tokens) = data::split_train_val(token_ids, VAL_FRACTION);
     let train_pairs = match build_pairs(&train_tokens) {
         Ok(pairs) => pairs,
@@ -353,7 +354,7 @@ fn split_train_val_pairs(
     Ok((train_pairs, val_pairs))
 }
 
-fn build_pairs(token_ids: &[usize]) -> Result<Vec<(usize, usize)>, ScalarError> {
+fn build_pairs(token_ids: &[usize]) -> Result<Vec<TokenPair>, ScalarError> {
     if token_ids.len() < 2 {
         return Err(ScalarError::EmptyDataset);
     }

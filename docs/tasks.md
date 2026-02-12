@@ -144,6 +144,6 @@
 - **Files**: project-wide
 - **Tests**: Clean clippy + fmt
 - **Done when**: No warnings
-- [ ] Run clippy and fix any warnings
-- [ ] Run fmt and fix any formatting
+- [x] Run clippy and fix any warnings
+- [x] Run fmt and fix any formatting
 - [ ] Document in CLAUDE.md

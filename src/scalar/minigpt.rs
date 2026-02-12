@@ -314,15 +314,15 @@ impl ScalarMiniGpt {
                 let he = hs + MINI_GPT_HEAD_DIM;
                 let q_h = q[hs..he].to_vec();
                 let mut attn_logits = Vec::with_capacity(keys[layer_id].len());
-                for t in 0..keys[layer_id].len() {
-                    let k_h = keys[layer_id][t][hs..he].to_vec();
+                for key_state in &keys[layer_id] {
+                    let k_h = key_state[hs..he].to_vec();
                     attn_logits.push(dot(&q_h, &k_h).mul(&inv_sqrt_head_dim));
                 }
                 let attn_weights = softmax(&attn_logits);
                 for j in 0..MINI_GPT_HEAD_DIM {
                     let mut head_terms = Vec::with_capacity(attn_weights.len());
-                    for (t, weight) in attn_weights.iter().enumerate() {
-                        head_terms.push(weight.mul(&values[layer_id][t][hs + j]));
+                    for (weight, value_state) in attn_weights.iter().zip(values[layer_id].iter()) {
+                        head_terms.push(weight.mul(&value_state[hs + j]));
                     }
                     x_attn.push(sum_values(&head_terms));
                 }
