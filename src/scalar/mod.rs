@@ -114,47 +114,89 @@ impl From<EvalGuardError> for ScalarError {
 pub fn train(config: &TrainConfig) -> Result<TrainMetrics, ScalarError> {
     let runtime = &config.runtime;
     let base_text = data::load_text(&runtime.data_path)?;
-    match runtime.model_kind {
-        ModelKind::Bigram => train_from_text(
-            &base_text,
-            config.steps,
-            runtime.seed,
-            config.optimizer,
-            runtime.style,
-            config.tie_lm_head,
-            config.input_rmsnorm,
-        ),
-        ModelKind::MiniGpt => minigpt::train_from_text(
-            &base_text,
-            config.steps,
-            runtime.seed,
-            config.optimizer,
-            runtime.style,
-            config.tie_lm_head,
-            config.input_rmsnorm,
-        ),
-    }
+    train_from_text_with_model_kind(
+        &base_text,
+        runtime.model_kind,
+        config.steps,
+        runtime.seed,
+        config.optimizer,
+        runtime.style,
+        config.tie_lm_head,
+        config.input_rmsnorm,
+    )
 }
 
 pub fn sample(config: &SampleConfig) -> Result<String, ScalarError> {
     let runtime = &config.runtime;
     let base_text = data::load_text(&runtime.data_path)?;
-    match runtime.model_kind {
+    sample_from_text_with_model_kind(
+        &base_text,
+        runtime.model_kind,
+        &config.prompt,
+        config.max_new_tokens,
+        config.temperature,
+        runtime.seed,
+        runtime.style,
+    )
+}
+
+pub(crate) fn train_from_text_with_model_kind(
+    text: &str,
+    model_kind: ModelKind,
+    steps: usize,
+    seed: u64,
+    optimizer: Optimizer,
+    style: Style,
+    tie_lm_head: bool,
+    input_rmsnorm: bool,
+) -> Result<TrainMetrics, ScalarError> {
+    match model_kind {
+        ModelKind::Bigram => train_from_text(
+            text,
+            steps,
+            seed,
+            optimizer,
+            style,
+            tie_lm_head,
+            input_rmsnorm,
+        ),
+        ModelKind::MiniGpt => minigpt::train_from_text(
+            text,
+            steps,
+            seed,
+            optimizer,
+            style,
+            tie_lm_head,
+            input_rmsnorm,
+        ),
+    }
+}
+
+pub(crate) fn sample_from_text_with_model_kind(
+    text: &str,
+    model_kind: ModelKind,
+    prompt: &str,
+    max_new_tokens: usize,
+    temperature: f64,
+    seed: u64,
+    style: Style,
+) -> Result<String, ScalarError> {
+    match model_kind {
         ModelKind::Bigram => sample_from_text(
-            &base_text,
-            &config.prompt,
-            config.max_new_tokens,
-            config.temperature,
-            runtime.seed,
-            runtime.style,
+            text,
+            prompt,
+            max_new_tokens,
+            temperature,
+            seed,
+            style,
         ),
         ModelKind::MiniGpt => minigpt::sample_from_text(
-            &base_text,
-            &config.prompt,
-            config.max_new_tokens,
-            config.temperature,
-            runtime.seed,
-            runtime.style,
+            text,
+            prompt,
+            max_new_tokens,
+            temperature,
+            seed,
+            style,
         ),
     }
 }

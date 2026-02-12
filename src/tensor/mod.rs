@@ -10,6 +10,7 @@ use rand::{Rng, SeedableRng};
 
 use crate::checkpoint::{CheckpointEvalError, persist_then_eval};
 use crate::config::{ModelKind, Optimizer, SampleConfig, Style, TrainConfig};
+use crate::eval::EvalGuardError;
 use crate::data::{self, TokenizerError};
 use crate::training;
 
@@ -23,6 +24,16 @@ const LOSS_WINDOW: usize = 50;
 const RMS_EPS: f64 = 1e-8;
 const LOG_EPS: f64 = 1e-12;
 const EVAL_EVERY: usize = training::EVAL_EVERY;
+#[cfg(feature = "tch-backend")]
+const MINI_GPT_EMBED_DIM: i64 = 16;
+#[cfg(feature = "tch-backend")]
+const MINI_GPT_BLOCK_SIZE: usize = 8;
+#[cfg(feature = "tch-backend")]
+const MINI_GPT_LEARNING_RATE: f64 = 0.02;
+#[cfg(feature = "tch-backend")]
+const MINI_GPT_ADAMW_LEARNING_RATE: f64 = 0.01;
+#[cfg(feature = "tch-backend")]
+const MINI_GPT_LOSS_WINDOW: usize = 50;
 
 type TokenPair = training::TokenPair;
 type PairSplits = training::PairSplits;
@@ -86,6 +97,7 @@ pub enum TensorError {
     Tokenizer(TokenizerError),
     EmptyDataset,
     InvalidTemperature(f64),
+    EvalGuard(EvalGuardError),
     UnsupportedModelKind(ModelKind),
     UnsupportedOptimizer(Optimizer),
     #[cfg(feature = "tch-backend")]
@@ -101,6 +113,7 @@ impl fmt::Display for TensorError {
             Self::InvalidTemperature(value) => {
                 write!(f, "temperature must be finite and > 0, got {value}")
             }
+            Self::EvalGuard(err) => write!(f, "{err}"),
             Self::UnsupportedModelKind(model_kind) => {
                 write!(f, "model kind {model_kind} is not supported by tensor mode")
             }
@@ -124,6 +137,12 @@ impl From<std::io::Error> for TensorError {
 impl From<TokenizerError> for TensorError {
     fn from(err: TokenizerError) -> Self {
         Self::Tokenizer(err)
+    }
+}
+
+impl From<EvalGuardError> for TensorError {
+    fn from(err: EvalGuardError) -> Self {
+        Self::EvalGuard(err)
     }
 }
 
@@ -274,14 +293,40 @@ pub fn sample(config: &SampleConfig) -> Result<String, TensorError> {
     let runtime = &config.runtime;
     ensure_tensor_support(runtime.model_kind)?;
     let base_text = data::load_text(&runtime.data_path)?;
-    sample_from_text(
+    sample_from_text_with_model_kind(
         &base_text,
+        runtime.model_kind,
         &config.prompt,
         config.max_new_tokens,
         config.temperature,
         runtime.seed,
         runtime.style,
     )
+}
+
+fn sample_from_text_with_model_kind(
+    text: &str,
+    model_kind: ModelKind,
+    prompt: &str,
+    max_new_tokens: usize,
+    temperature: f64,
+    seed: u64,
+    style: Style,
+) -> Result<String, TensorError> {
+    match model_kind {
+        ModelKind::Bigram => sample_from_text(text, prompt, max_new_tokens, temperature, seed, style),
+        #[cfg(feature = "tch-backend")]
+        ModelKind::MiniGpt => sample_from_text_tch_minigpt(
+            text,
+            prompt,
+            max_new_tokens,
+            temperature,
+            seed,
+            style,
+        ),
+        #[cfg(not(feature = "tch-backend"))]
+        ModelKind::MiniGpt => Err(TensorError::UnsupportedModelKind(model_kind)),
+    }
 }
 
 #[cfg(test)]
@@ -325,8 +370,8 @@ fn train_from_text_with_checkpoints(
     runtime: TensorTrainRuntime<'_>,
 ) -> Result<TrainMetrics, TensorError> {
     #[cfg(feature = "tch-backend")]
-    {
-        train_from_text_tch(
+    match model_kind {
+        ModelKind::Bigram => train_from_text_tch(
             text,
             steps,
             seed,
@@ -336,10 +381,23 @@ fn train_from_text_with_checkpoints(
             tie_lm_head,
             input_rmsnorm,
             runtime,
-        )
+        ),
+        ModelKind::MiniGpt => train_from_text_tch_minigpt(
+            text,
+            steps,
+            seed,
+            optimizer,
+            style,
+            tie_lm_head,
+            input_rmsnorm,
+            runtime,
+        ),
     }
     #[cfg(not(feature = "tch-backend"))]
     {
+        if !matches!(model_kind, ModelKind::Bigram) {
+            return Err(TensorError::UnsupportedModelKind(model_kind));
+        }
         train_from_text_cpu(
             text,
             steps,
@@ -612,6 +670,296 @@ fn train_from_text_tch(
 }
 
 #[cfg(feature = "tch-backend")]
+#[derive(Clone)]
+struct TensorMiniGptWindow {
+    context: Vec<i64>,
+    target: i64,
+}
+
+#[cfg(feature = "tch-backend")]
+fn train_from_text_tch_minigpt(
+    text: &str,
+    steps: usize,
+    seed: u64,
+    optimizer: Optimizer,
+    style: Style,
+    tie_lm_head: bool,
+    input_rmsnorm: bool,
+    runtime: TensorTrainRuntime<'_>,
+) -> Result<TrainMetrics, TensorError> {
+    ensure_tensor_optimizer_support(optimizer)?;
+    let corpus = styled_corpus(text, style);
+    let tokenizer = data::Tokenizer::from_text(&corpus);
+    let token_ids = tokenizer.encode_with_bos(&corpus)?;
+    let (train_tokens, val_tokens) =
+        training::split_train_val_tokens(&token_ids).map_err(|_| TensorError::EmptyDataset)?;
+    let train_windows = build_minigpt_windows(&train_tokens, MINI_GPT_BLOCK_SIZE);
+    let mut val_windows = build_minigpt_windows(&val_tokens, MINI_GPT_BLOCK_SIZE);
+    if val_windows.is_empty() {
+        val_windows = train_windows.clone();
+    }
+    if train_windows.is_empty() {
+        return Err(TensorError::EmptyDataset);
+    }
+
+    let device = resolve_tch_device();
+    let device_label = tch_device_label(device);
+    let using_gpu = matches!(device, Device::Cuda(_));
+    let vs = VarStore::new(device);
+    let root = &vs.root();
+    let vocab_size = i64::try_from(tokenizer.vocab_size()).expect("vocab size fits i64");
+    let block_size = i64::try_from(MINI_GPT_BLOCK_SIZE).expect("block size fits i64");
+    let token_embedding = root.var(
+        "token_embedding",
+        &[vocab_size, MINI_GPT_EMBED_DIM],
+        nn::Init::Randn {
+            mean: 0.0,
+            stdev: 0.02,
+        },
+    );
+    let position_embedding = root.var(
+        "position_embedding",
+        &[block_size, MINI_GPT_EMBED_DIM],
+        nn::Init::Randn {
+            mean: 0.0,
+            stdev: 0.02,
+        },
+    );
+    let lm_head = if tie_lm_head {
+        None
+    } else {
+        Some(root.var(
+            "lm_head",
+            &[vocab_size, MINI_GPT_EMBED_DIM],
+            nn::Init::Randn {
+                mean: 0.0,
+                stdev: 0.02,
+            },
+        ))
+    };
+
+    let parameter_count: usize = vs.trainable_variables().iter().map(Tensor::numel).sum();
+    let base_learning_rate = match optimizer {
+        Optimizer::AdamW => MINI_GPT_ADAMW_LEARNING_RATE,
+        Optimizer::Sgd => MINI_GPT_LEARNING_RATE,
+    };
+    let mut optimizer = match optimizer {
+        Optimizer::AdamW => nn::AdamW::default().build(&vs, MINI_GPT_ADAMW_LEARNING_RATE)?,
+        Optimizer::Sgd => nn::Sgd::default().build(&vs, MINI_GPT_LEARNING_RATE)?,
+    };
+    let mut rng = StdRng::seed_from_u64(seed ^ 0xA0E3_3D77_22A9_F14C);
+    let mut losses = Vec::with_capacity(steps.max(1));
+    let mut val_loss = Some(mean_nll_loss_tch_minigpt(
+        &token_embedding,
+        lm_head.as_ref(),
+        &position_embedding,
+        &val_windows,
+        input_rmsnorm,
+        device,
+    ));
+    let started = Instant::now();
+
+    if steps == 0 {
+        let loss = mean_nll_loss_tch_minigpt(
+            &token_embedding,
+            lm_head.as_ref(),
+            &position_embedding,
+            &train_windows,
+            input_rmsnorm,
+            device,
+        );
+        losses.push(loss);
+        maybe_persist_checkpoint(
+            runtime.checkpoint_every,
+            runtime.checkpoint_dir,
+            "tch-minigpt",
+            0,
+            steps,
+            losses[0],
+            val_loss,
+        )?;
+    } else {
+        for step in 0..steps {
+            let window_idx = rng.gen_range(0..train_windows.len());
+            let window = &train_windows[window_idx];
+            let context = Tensor::from_slice(&window.context).to(device);
+            let target = Tensor::from_slice(&[window.target]).to(device);
+
+            let loss = tch_minigpt_forward_loss_fn(
+                &token_embedding,
+                lm_head.as_ref(),
+                &position_embedding,
+                &context,
+                &target,
+                input_rmsnorm,
+            );
+            let lr = base_learning_rate * lr_multiplier(step, steps);
+            optimizer.set_lr(lr);
+            let loss_value = loss.double_value(&[]);
+            optimizer.backward_step(&loss);
+            losses.push(loss_value);
+            let step_idx = step + 1;
+            if should_eval(step_idx, steps, EVAL_EVERY) {
+                val_loss = Some(mean_nll_loss_tch_minigpt(
+                    &token_embedding,
+                    lm_head.as_ref(),
+                    &position_embedding,
+                    &val_windows,
+                    input_rmsnorm,
+                    device,
+                ));
+            }
+            maybe_persist_checkpoint(
+                runtime.checkpoint_every,
+                runtime.checkpoint_dir,
+                "tch-minigpt",
+                step_idx,
+                steps,
+                loss_value,
+                val_loss,
+            )?;
+        }
+    }
+
+    let elapsed_seconds = started.elapsed().as_secs_f64();
+    let steps_per_sec = if steps == 0 || elapsed_seconds <= 0.0 {
+        0.0
+    } else {
+        (steps as f64) / elapsed_seconds
+    };
+    let tokens_per_sec = steps_per_sec * (MINI_GPT_BLOCK_SIZE as f64);
+
+    let last_n = losses.len().min(MINI_GPT_LOSS_WINDOW);
+    let tail = &losses[losses.len() - last_n..];
+    let mean_loss_last_n = tail.iter().sum::<f64>() / (tail.len() as f64);
+    let final_loss = *losses
+        .last()
+        .expect("losses contains one element when steps=0");
+
+    Ok(TrainMetrics {
+        style,
+        tie_lm_head,
+        input_rmsnorm,
+        backend: "tch",
+        device: device_label,
+        using_gpu,
+        parameter_count,
+        steps,
+        final_loss,
+        val_loss,
+        mean_loss_last_n,
+        last_n,
+        steps_per_sec,
+        tokens_per_sec,
+        vocab_size: tokenizer.vocab_size(),
+        train_tokens: train_windows.len(),
+    })
+}
+
+#[cfg(feature = "tch-backend")]
+fn build_minigpt_windows(
+    token_ids: &[usize],
+    block_size: usize,
+) -> Vec<TensorMiniGptWindow> {
+    if token_ids.len() < 2 {
+        return Vec::new();
+    }
+    let mut windows = Vec::with_capacity(token_ids.len().saturating_sub(1));
+    for target_idx in 1..token_ids.len() {
+        let start = target_idx.saturating_sub(block_size);
+        let context = token_ids[start..target_idx]
+            .iter()
+            .map(|value| i64::try_from(*value).expect("token id fits i64"))
+            .collect::<Vec<_>>();
+        if context.is_empty() {
+            continue;
+        }
+        windows.push(TensorMiniGptWindow {
+            context,
+            target: i64::try_from(token_ids[target_idx]).expect("token id fits i64"),
+        });
+    }
+    windows
+}
+
+#[cfg(feature = "tch-backend")]
+fn tch_minigpt_forward_loss(
+    token_embedding: &Tensor,
+    lm_head: Option<&Tensor>,
+    position_embedding: &Tensor,
+    context: &Tensor,
+    input_rmsnorm: bool,
+) -> Tensor {
+    let window_len = context.size()[0];
+    let position_ids = Tensor::arange_start(
+        0,
+        window_len,
+        (Kind::Int64, context.device()),
+    );
+    let token_emb = token_embedding.index_select(0, context);
+    let position_emb = position_embedding.index_select(0, &position_ids);
+    let hidden = token_emb + position_emb;
+    let hidden = hidden.mean_dim(&[0_i64][..], false, Kind::Float);
+    let hidden = if input_rmsnorm {
+        let mean_sq = hidden.pow_tensor_scalar(2.0).mean(Kind::Float);
+        let inv_rms = (mean_sq + RMS_EPS).rsqrt();
+        hidden * inv_rms
+    } else {
+        hidden
+    };
+    let projection = match lm_head {
+        Some(matrix) => matrix,
+        None => token_embedding,
+    };
+    let logits = hidden.unsqueeze(0).matmul(&projection.transpose(0, 1));
+    logits
+}
+
+#[cfg(feature = "tch-backend")]
+fn tch_minigpt_forward_loss_fn(
+    token_embedding: &Tensor,
+    lm_head: Option<&Tensor>,
+    position_embedding: &Tensor,
+    context: &Tensor,
+    target: &Tensor,
+    input_rmsnorm: bool,
+) -> Tensor {
+    tch_minigpt_forward_loss(token_embedding, lm_head, position_embedding, context, input_rmsnorm)
+        .cross_entropy_for_logits(target)
+}
+
+#[cfg(feature = "tch-backend")]
+fn mean_nll_loss_tch_minigpt(
+    token_embedding: &Tensor,
+    lm_head: Option<&Tensor>,
+    position_embedding: &Tensor,
+    windows: &[TensorMiniGptWindow],
+    input_rmsnorm: bool,
+    device: Device,
+) -> f64 {
+    if windows.is_empty() {
+        return 0.0;
+    }
+    let mut total_loss = 0.0;
+    tch::no_grad(|| {
+        for window in windows {
+            let context = Tensor::from_slice(&window.context).to(device);
+            let target = Tensor::from_slice(&[window.target]).to(device);
+            let loss = tch_minigpt_forward_loss_fn(
+                token_embedding,
+                lm_head,
+                position_embedding,
+                &context,
+                &target,
+                input_rmsnorm,
+            );
+            total_loss += loss.double_value(&[]);
+        }
+    });
+    total_loss / (windows.len() as f64)
+}
+
+#[cfg(feature = "tch-backend")]
 fn resolve_tch_device() -> Device {
     if tch::Cuda::is_available() {
         Device::Cuda(0)
@@ -691,6 +1039,91 @@ fn mean_nll_loss_tch(
         let loss = tch_forward_loss(token_embedding, lm_head, &context, &target, input_rmsnorm);
         loss.double_value(&[])
     })
+}
+
+#[cfg(feature = "tch-backend")]
+fn sample_from_text_tch_minigpt(
+    text: &str,
+    prompt: &str,
+    max_new_tokens: usize,
+    temperature: f64,
+    seed: u64,
+    style: Style,
+) -> Result<String, TensorError> {
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return Err(TensorError::InvalidTemperature(temperature));
+    }
+
+    let corpus = styled_corpus(text, style);
+    let tokenizer = data::Tokenizer::from_text(&corpus);
+    let token_ids = tokenizer.encode_with_bos(&corpus)?;
+    let prompt_ids = tokenizer.encode(prompt)?;
+    crate::eval::validate_prompt_length(prompt_ids.len(), MINI_GPT_BLOCK_SIZE.saturating_sub(1))
+        .map_err(TensorError::from)?;
+
+    if token_ids.len() < 2 {
+        return Err(TensorError::EmptyDataset);
+    }
+
+    let device = resolve_tch_device();
+    let _ = tch::manual_seed(seed as i64);
+    let vocab_size = i64::try_from(tokenizer.vocab_size()).expect("vocab size fits i64");
+    let block_size = i64::try_from(MINI_GPT_BLOCK_SIZE).expect("block size fits i64");
+    let vs = VarStore::new(device);
+    let root = &vs.root();
+    let token_embedding = root.var(
+        "token_embedding",
+        &[vocab_size, MINI_GPT_EMBED_DIM],
+        nn::Init::Randn {
+            mean: 0.0,
+            stdev: 0.02,
+        },
+    );
+    let position_embedding = root.var(
+        "position_embedding",
+        &[block_size, MINI_GPT_EMBED_DIM],
+        nn::Init::Randn {
+            mean: 0.0,
+            stdev: 0.02,
+        },
+    );
+
+    let mut generated = prompt.to_string();
+    let mut context = vec![i64::try_from(tokenizer.bos_id()).expect("bos id fits i64")];
+    context.extend(prompt_ids.iter().map(|value| i64::try_from(*value).expect("token id fits i64")));
+
+    for _ in 0..max_new_tokens {
+        let start = context.len().saturating_sub(MINI_GPT_BLOCK_SIZE);
+        let context_window = &context[start..];
+        let context_tensor = Tensor::from_slice(context_window).to(device);
+        let logits = tch_minigpt_forward_loss(
+            &token_embedding,
+            None,
+            &position_embedding,
+            &context_tensor,
+            false,
+        );
+        let scaled_logits = logits / temperature;
+        let sampled_id = scaled_logits
+            .softmax(-1, Kind::Float)
+            .squeeze()
+            .multinomial(1, false)
+            .int64_value(&[0]);
+        if sampled_id == i64::try_from(tokenizer.bos_id()).expect("bos id fits i64") {
+            continue;
+        }
+        let next_id = usize::try_from(sampled_id).expect("sampled id fits usize");
+        let next_char = tokenizer
+            .char_for_id(next_id)
+            .ok_or(TokenizerError::UnknownId(next_id))?;
+        generated.push(next_char);
+        context.push(sampled_id);
+        if context.len() > MINI_GPT_BLOCK_SIZE {
+            let _ = context.remove(0);
+        }
+    }
+
+    Ok(generated)
 }
 
 fn sample_from_text(
@@ -863,10 +1296,12 @@ fn split_train_val_pairs(token_ids: &[usize]) -> Result<PairSplits, TensorError>
 }
 
 fn ensure_tensor_support(model_kind: ModelKind) -> Result<(), TensorError> {
-    if matches!(model_kind, ModelKind::Bigram) {
-        Ok(())
-    } else {
-        Err(TensorError::UnsupportedModelKind(model_kind))
+    match model_kind {
+        ModelKind::Bigram => Ok(()),
+        #[cfg(feature = "tch-backend")]
+        ModelKind::MiniGpt => Ok(()),
+        #[cfg(not(feature = "tch-backend"))]
+        ModelKind::MiniGpt => Err(TensorError::UnsupportedModelKind(model_kind)),
     }
 }
 
@@ -1142,12 +1577,14 @@ mod tests {
     #[test]
     fn tensor_public_rejections_are_reported_consistently() {
         let cases = [
+            #[cfg(not(feature = "tch-backend"))]
             PublicRejectionCase::Train {
                 label: "train should reject mini-gpt in tensor mode",
                 model_kind: ModelKind::MiniGpt,
                 optimizer: Optimizer::Sgd,
                 expected: RejectionExpectation::ModelKind(ModelKind::MiniGpt),
             },
+            #[cfg(not(feature = "tch-backend"))]
             PublicRejectionCase::Sample {
                 label: "sample should reject mini-gpt in tensor mode",
                 model_kind: ModelKind::MiniGpt,
@@ -1189,12 +1626,14 @@ mod tests {
         let path_string = path.as_path_string();
 
         let cases = [
+            #[cfg(not(feature = "tch-backend"))]
             CliRejectionCase::Train {
                 label: "train cli should reject mini-gpt in tensor mode",
                 model_kind: ModelKind::MiniGpt,
                 optimizer: Optimizer::Sgd,
                 expected: RejectionExpectation::ModelKind(ModelKind::MiniGpt),
             },
+            #[cfg(not(feature = "tch-backend"))]
             CliRejectionCase::Sample {
                 label: "sample cli should reject mini-gpt in tensor mode",
                 model_kind: ModelKind::MiniGpt,
@@ -1240,6 +1679,63 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "tch-backend")]
+    #[test]
+    fn tensor_public_mini_gpt_train_runs_in_tch() {
+        let metrics = super::train(&train_config(ModelKind::MiniGpt, Optimizer::Sgd))
+            .expect("mini-gpt tensor training should run with tch backend");
+        assert_eq!(metrics.backend, "tch");
+        assert_eq!(metrics.steps, 1);
+        assert!(metrics.final_loss.is_finite());
+        assert!(metrics.train_tokens > 0);
+        assert!(metrics.val_loss.is_some());
+    }
+
+    #[cfg(feature = "tch-backend")]
+    #[test]
+    fn tensor_public_mini_gpt_zero_step_train_runs_in_tch() {
+        let mut config = train_config(ModelKind::MiniGpt, Optimizer::Sgd);
+        config.steps = 0;
+        let metrics = super::train(&config).expect("mini-gpt tensor zero-step training should run");
+        assert_eq!(metrics.backend, "tch");
+        assert_eq!(metrics.steps, 0);
+        assert!(metrics.final_loss.is_finite());
+        assert!(metrics.train_tokens > 0);
+    }
+
+    #[cfg(feature = "tch-backend")]
+    #[test]
+    fn tensor_public_mini_gpt_sample_runs_in_tch() {
+        let output = super::sample(&sample_config(ModelKind::MiniGpt))
+            .expect("mini-gpt tensor sampling should run with tch backend");
+        assert!(!output.is_empty());
+        assert!(output.starts_with("a"));
+    }
+
+    #[cfg(feature = "tch-backend")]
+    #[test]
+    fn tensor_public_mini_gpt_rejects_overlong_prompt() {
+        let mut config = sample_config(ModelKind::MiniGpt);
+        config.prompt = "aaaaaaaa".to_string();
+        let err = super::sample(&config).expect_err("overlong prompt should fail");
+        match err {
+            TensorError::EvalGuard(_) => {}
+            _ => panic!("unexpected error type: {err:?}"),
+        }
+    }
+
+    #[cfg(feature = "tch-backend")]
+    #[test]
+    fn tensor_public_mini_gpt_rejects_invalid_temperature() {
+        let mut config = sample_config(ModelKind::MiniGpt);
+        config.temperature = 0.0;
+        let err = super::sample(&config).expect_err("invalid temperature should fail");
+        match err {
+            TensorError::InvalidTemperature(value) => assert_eq!(value, 0.0),
+            _ => panic!("unexpected error type: {err:?}"),
         }
     }
 
@@ -1477,20 +1973,24 @@ mod tests {
         )
         .expect("training should succeed with checkpoints");
 
+        let backend = if cfg!(feature = "tch-backend") {
+            "tch"
+        } else {
+            "cpu-native"
+        };
+
+        let step_000002 = format!("tensor_{backend}_step_000002.ckpt");
+        let step_000004 = format!("tensor_{backend}_step_000004.ckpt");
+        let step_000005 = format!("tensor_{backend}_step_000005.ckpt");
+
         assert!(
-            checkpoint_dir
-                .join("tensor_cpu-native_step_000002.ckpt")
-                .exists()
+            checkpoint_dir.join(step_000002).exists()
         );
         assert!(
-            checkpoint_dir
-                .join("tensor_cpu-native_step_000004.ckpt")
-                .exists()
+            checkpoint_dir.join(step_000004).exists()
         );
         assert!(
-            checkpoint_dir
-                .join("tensor_cpu-native_step_000005.ckpt")
-                .exists()
+            checkpoint_dir.join(step_000005).exists()
         );
 
         let _ = fs::remove_dir_all(&checkpoint_dir);
