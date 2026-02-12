@@ -1,5 +1,7 @@
 # nanochat-rs-next
 
+[![CI](https://github.com/ricardofrantz/nanochat-rs-next/actions/workflows/ci.yml/badge.svg)](https://github.com/ricardofrantz/nanochat-rs-next/actions/workflows/ci.yml)
+
 `nanochat-rs-next` is a Rust-first continuation of [`AntigmaLabs/nanochat-rs`](https://github.com/AntigmaLabs/nanochat-rs), benchmarked against [`karpathy/nanochat`](https://github.com/karpathy/nanochat).
 
 ## Goal

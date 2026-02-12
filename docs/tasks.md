@@ -124,10 +124,10 @@
 - **Files**: `.github/workflows/ci.yml` (new)
 - **Tests**: CI passes on push to master
 - **Done when**: Green badge on README
-- [ ] Write workflow file
-- [ ] Add clippy lint step
-- [ ] Add test timeout (10s)
-- [ ] Add badge to README
+- [x] Write workflow file
+- [x] Add clippy lint step
+- [x] Add test timeout (10s)
+- [x] Add badge to README
 
 ### I.2: Wire checkpoint into tensor training loop [FR-008]
 - **What**: Call `persist_then_eval` at checkpoint intervals during tensor training
