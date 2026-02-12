@@ -22,6 +22,9 @@ The objective is to become:
 
 Rule: benchmark semantics and behavior contracts are anchored to `karpathy/nanochat`.
 
+Pinned baseline ref for initial benchmarking:
+`2f096867244e3d00a50284d1be05fa3f5dcfb84b` (master head observed on 2026-02-12).
+
 ## 3. Scope
 
 In scope:
@@ -99,6 +102,5 @@ A task is done when:
 
 ## 9. Open Questions
 
-1. Which `karpathy/nanochat` commit/tag should be the first pinned benchmark baseline?
-2. What quality tolerance do we accept for speed-focused changes?
-3. Which hardware profiles are mandatory in CI versus optional manual runs?
+1. What quality tolerance do we accept for speed-focused changes?
+2. Which hardware profiles are mandatory in CI versus optional manual runs?

@@ -392,10 +392,11 @@ fn train_from_text_tch(
 
     if steps == 0 {
         let (context_id, target_id) = pairs[0];
-        let context = Tensor::from_slice(&[i64::try_from(context_id).expect("context id fits i64")])
-            .to(device);
-        let target = Tensor::from_slice(&[i64::try_from(target_id).expect("target id fits i64")])
-            .to(device);
+        let context =
+            Tensor::from_slice(&[i64::try_from(context_id).expect("context id fits i64")])
+                .to(device);
+        let target =
+            Tensor::from_slice(&[i64::try_from(target_id).expect("target id fits i64")]).to(device);
         let loss = tch_forward_loss(
             &token_embedding,
             lm_head.as_ref(),
@@ -772,9 +773,8 @@ mod tests {
 
     #[test]
     fn train_reports_backend_and_device() {
-        let metrics =
-            train_from_text("abababababababab", 1, 5, Style::Classic, true, false)
-                .expect("metrics");
+        let metrics = train_from_text("abababababababab", 1, 5, Style::Classic, true, false)
+            .expect("metrics");
         assert!(!metrics.backend.is_empty());
         assert!(!metrics.device.is_empty());
         if metrics.using_gpu {

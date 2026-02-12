@@ -105,12 +105,18 @@ LIBTORCH_USE_PYTORCH=1 cargo run --release --features tch-backend -- train --mod
 
 ## Benchmark Workflow
 
+Default pinned `nanochat` baseline ref:
+`2f096867244e3d00a50284d1be05fa3f5dcfb84b` (master head observed on 2026-02-12).
+
 ```bash
 # GPU-first benchmark run
 bash scripts/colab_gpu_benchmark.sh
 
 # explicit profile and baseline
 PROFILE=full BASELINE=nanochat bash scripts/colab_gpu_benchmark.sh
+
+# local CPU snapshot (no GPU required)
+python3 scripts/benchmark_karpathy.py --baseline nanochat --no-require-gpu --install-deps --ours-cargo-features "" --nanochat-device-type cpu --nanochat-disable-compile --nanochat-target-flops -1 --nanochat-target-param-data-ratio -1 --nanochat-num-iterations 1 --nanochat-eval-every -1 --nanochat-max-chars 50000 --nanochat-depth 1 --nanochat-head-dim 16 --nanochat-max-seq-len 64 --nanochat-device-batch-size 1 --nanochat-total-batch-size 8 --nanochat-train-timeout-sec 120
 
 # direct script usage
 python3 scripts/benchmark_karpathy.py --baseline nanochat --install-deps --require-gpu --ours-cargo-features tch-backend

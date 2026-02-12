@@ -32,6 +32,7 @@ RESULTS_DIR = REPO_ROOT / "results"
 EXTERNAL_DIR = REPO_ROOT / "external"
 DEFAULT_TORCH_INDEX = "https://download.pytorch.org/whl/cu128"
 DEFAULT_TORCH_FALLBACK_INDEX = "https://download.pytorch.org/whl/cu126"
+DEFAULT_NANOCHAT_PINNED_REF = "2f096867244e3d00a50284d1be05fa3f5dcfb84b"
 
 
 def run_bash(
@@ -40,28 +41,53 @@ def run_bash(
     cwd: pathlib.Path | None = None,
     env: dict[str, str] | None = None,
     check: bool = True,
+    timeout_sec: float | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
-    proc = subprocess.run(
-        ["bash", "-lc", command],
-        cwd=str(cwd) if cwd else None,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    elapsed = time.perf_counter() - started
-    result = {
-        "command": command,
-        "cwd": str(cwd) if cwd else str(REPO_ROOT),
-        "returncode": proc.returncode,
-        "elapsed_sec": elapsed,
-        "output": proc.stdout,
-    }
-    if check and proc.returncode != 0:
-        tail = proc.stdout[-8000:]
+    try:
+        proc = subprocess.run(
+            ["bash", "-lc", command],
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_sec,
+        )
+        elapsed = time.perf_counter() - started
+        result = {
+            "command": command,
+            "cwd": str(cwd) if cwd else str(REPO_ROOT),
+            "returncode": proc.returncode,
+            "elapsed_sec": elapsed,
+            "output": proc.stdout,
+            "timed_out": False,
+            "timeout_sec": timeout_sec,
+        }
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.perf_counter() - started
+        output = ""
+        if exc.stdout is not None:
+            output = exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode("utf-8", errors="replace")
+        result = {
+            "command": command,
+            "cwd": str(cwd) if cwd else str(REPO_ROOT),
+            "returncode": 124,
+            "elapsed_sec": elapsed,
+            "output": output,
+            "timed_out": True,
+            "timeout_sec": timeout_sec,
+        }
+        if check:
+            tail = output[-8000:]
+            raise RuntimeError(
+                f"command timed out ({timeout_sec}s): {command}\n"
+                f"--- output tail ---\n{tail}\n--- end tail ---"
+            )
+    if check and result["returncode"] != 0:
+        tail = result["output"][-8000:]
         raise RuntimeError(
-            f"command failed ({proc.returncode}): {command}\n"
+            f"command failed ({result['returncode']}): {command}\n"
             f"--- output tail ---\n{tail}\n--- end tail ---"
         )
     return result
@@ -80,6 +106,8 @@ def write_command_log(log_dir: pathlib.Path, name: str, result: dict[str, Any]) 
         f"cwd: {result['cwd']}",
         f"returncode: {result['returncode']}",
         f"elapsed_sec: {result['elapsed_sec']:.3f}",
+        f"timed_out: {result.get('timed_out', False)}",
+        f"timeout_sec: {result.get('timeout_sec')}",
         "",
         result["output"],
     ]
@@ -380,7 +408,10 @@ def ensure_uv(install_deps: bool, log_dir: pathlib.Path) -> None:
 def run_nanochat(args: argparse.Namespace, log_dir: pathlib.Path, nanochat_repo: pathlib.Path) -> dict[str, Any]:
     ensure_uv(args.install_deps, log_dir)
     if args.install_deps:
-        sync = run_bash("uv sync --extra gpu", cwd=nanochat_repo)
+        sync_cmd = "uv sync --extra gpu"
+        if args.nanochat_device_type != "cuda":
+            sync_cmd = "uv sync"
+        sync = run_bash(sync_cmd, cwd=nanochat_repo)
         write_command_log(log_dir, "nanochat_uv_sync", sync)
     elif not (nanochat_repo / ".venv").exists():
         raise RuntimeError(
@@ -390,6 +421,8 @@ def run_nanochat(args: argparse.Namespace, log_dir: pathlib.Path, nanochat_repo:
     env = os.environ.copy()
     env["OMP_NUM_THREADS"] = "1"
     env["NANOCHAT_BASE_DIR"] = str(nanochat_repo / ".bench_cache")
+    if args.nanochat_disable_compile:
+        env["TORCH_COMPILE_DISABLE"] = "1"
 
     download = run_bash(
         f"uv run python -m nanochat.dataset -n {args.nanochat_num_shards} -w 2",
@@ -407,7 +440,7 @@ def run_nanochat(args: argparse.Namespace, log_dir: pathlib.Path, nanochat_repo:
 
     base_train_cmd = (
         "uv run python -m scripts.base_train "
-        "--device-type=cuda "
+        f"--device-type={shlex.quote(args.nanochat_device_type)} "
         f"--depth={args.nanochat_depth} "
         f"--head-dim={args.nanochat_head_dim} "
         "--window-pattern=L "
@@ -419,10 +452,18 @@ def run_nanochat(args: argparse.Namespace, log_dir: pathlib.Path, nanochat_repo:
         "--core-metric-every=-1 "
         "--sample-every=-1 "
         "--save-every=-1 "
+        f"--target-flops={args.nanochat_target_flops} "
+        f"--target-param-data-ratio={args.nanochat_target_param_data_ratio} "
         f"--num-iterations={args.nanochat_num_iterations} "
         "--run=dummy"
     )
-    train = run_bash(base_train_cmd, cwd=nanochat_repo, env=env)
+    train = run_bash(
+        base_train_cmd,
+        cwd=nanochat_repo,
+        env=env,
+        check=False,
+        timeout_sec=args.nanochat_train_timeout_sec,
+    )
     write_command_log(log_dir, "nanochat_base_train", train)
 
     step_re = re.compile(
@@ -451,10 +492,18 @@ def run_nanochat(args: argparse.Namespace, log_dir: pathlib.Path, nanochat_repo:
     for m in min_val_re.finditer(train["output"]):
         min_val = float(m.group(1))
 
+    status = "ok"
+    if train.get("timed_out"):
+        status = "timeout"
+    elif train["returncode"] != 0:
+        status = "failed"
+
     return {
-        "status": "ok",
+        "status": status,
         "returncode": train["returncode"],
         "elapsed_sec": train["elapsed_sec"],
+        "timed_out": train.get("timed_out", False),
+        "timeout_sec": train.get("timeout_sec"),
         "commit": git_commit(nanochat_repo),
         "steps_tail": steps[-5:],
         "last_step": steps[-1] if steps else None,
@@ -476,6 +525,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- Ours dataset: `{summary['ours_data_path']}`")
     lines.append(f"- Ours cargo features: `{summary['args']['ours_cargo_features']}`")
     lines.append(f"- nanochat ref: `{summary['args']['nanochat_ref']}`")
+    lines.append(f"- nanochat device type: `{summary['args']['nanochat_device_type']}`")
     if summary.get("resolved_refs", {}).get("nanochat"):
         lines.append(f"- nanochat resolved ref: `{summary['resolved_refs']['nanochat']}`")
     if summary.get("python_torch"):
@@ -523,6 +573,9 @@ def render_markdown(summary: dict[str, Any]) -> str:
     if nanochat:
         lines.append("## nanochat")
         lines.append("")
+        lines.append(f"- Status: `{nanochat['status']}`")
+        if nanochat.get("timed_out"):
+            lines.append(f"- Timeout: `{nanochat.get('timeout_sec')}s`")
         lines.append(f"- Commit: `{nanochat['commit']}`")
         lines.append(f"- Elapsed: `{nanochat['elapsed_sec']:.3f}s`")
         if nanochat.get("last_eval"):
@@ -549,8 +602,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--nanochat-ref",
         type=str,
-        default="auto",
-        help="git ref to checkout for nanochat (branch/tag/sha), default auto=origin/HEAD",
+        default=DEFAULT_NANOCHAT_PINNED_REF,
+        help=(
+            "git ref to checkout for nanochat (branch/tag/sha), "
+            f"default pinned ref={DEFAULT_NANOCHAT_PINNED_REF}"
+        ),
     )
 
     parser.add_argument("--seed", type=int, default=1337)
@@ -567,6 +623,18 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--nanochat-num-shards", type=int, default=1)
     parser.add_argument("--nanochat-max-chars", type=int, default=20_000_000)
+    parser.add_argument(
+        "--nanochat-device-type",
+        type=str,
+        choices=["cuda", "cpu", "mps"],
+        default="cuda",
+    )
+    parser.add_argument(
+        "--nanochat-disable-compile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="set TORCH_COMPILE_DISABLE=1 for nanochat run (useful for lightweight CPU snapshots)",
+    )
     parser.add_argument("--nanochat-depth", type=int, default=4)
     parser.add_argument("--nanochat-head-dim", type=int, default=64)
     parser.add_argument("--nanochat-max-seq-len", type=int, default=512)
@@ -574,8 +642,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nanochat-total-batch-size", type=int, default=4096)
     parser.add_argument("--nanochat-eval-every", type=int, default=20)
     parser.add_argument("--nanochat-eval-tokens", type=int, default=32768)
+    parser.add_argument("--nanochat-target-flops", type=float, default=-1.0)
+    parser.add_argument("--nanochat-target-param-data-ratio", type=float, default=-1.0)
+    parser.add_argument(
+        "--nanochat-train-timeout-sec",
+        type=float,
+        default=0.0,
+        help="timeout for nanochat base_train command; <=0 disables timeout",
+    )
     parser.add_argument("--nanochat-num-iterations", type=int, default=60)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.nanochat_train_timeout_sec <= 0:
+        args.nanochat_train_timeout_sec = None
+    return args
 
 
 def main() -> int:
@@ -606,8 +685,12 @@ def main() -> int:
         "runs": {},
     }
 
+    ours_features = {
+        feature.strip() for feature in args.ours_cargo_features.split(",") if feature.strip()
+    }
+    needs_torch_runtime = args.require_gpu or ("tch-backend" in ours_features)
     python_torch = ensure_ours_tch_deps(
-        args.install_deps,
+        args.install_deps and needs_torch_runtime,
         logs_dir,
         args.torch_pip_index_url,
         args.torch_pip_fallback_index_url,

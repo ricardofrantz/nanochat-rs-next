@@ -20,7 +20,8 @@ TORCH_PIP_FALLBACK_INDEX_URL="${TORCH_PIP_FALLBACK_INDEX_URL:-https://download.p
 OURS_CARGO_FEATURES="${OURS_CARGO_FEATURES:-tch-backend}"
 REQUIRE_GPU="${REQUIRE_GPU:-1}" # 1|0
 RUN_DOCTOR="${RUN_DOCTOR:-1}" # 1|0
-NANOCHAT_REF="${NANOCHAT_REF:-auto}"
+NANOCHAT_REF="${NANOCHAT_REF:-2f096867244e3d00a50284d1be05fa3f5dcfb84b}"
+NANOCHAT_DEVICE_TYPE="${NANOCHAT_DEVICE_TYPE:-cuda}"
 
 if [[ "${BASELINE}" != "nanochat" ]]; then
   echo "Only BASELINE=nanochat is supported in this repo."
@@ -60,13 +61,14 @@ if [[ "${PROFILE}" == "auto" ]]; then
   fi
 fi
 
-echo "Using PROFILE=${PROFILE} BASELINE=${BASELINE} NANOCHAT_REF=${NANOCHAT_REF}"
+echo "Using PROFILE=${PROFILE} BASELINE=${BASELINE} NANOCHAT_REF=${NANOCHAT_REF} NANOCHAT_DEVICE_TYPE=${NANOCHAT_DEVICE_TYPE}"
 
 ARGS=(
   --baseline "${BASELINE}"
   --install-deps
   --ours-cargo-features "${OURS_CARGO_FEATURES}"
   --nanochat-ref "${NANOCHAT_REF}"
+  --nanochat-device-type "${NANOCHAT_DEVICE_TYPE}"
   --torch-pip-index-url "${TORCH_PIP_INDEX_URL}"
   --torch-pip-fallback-index-url "${TORCH_PIP_FALLBACK_INDEX_URL}"
 )

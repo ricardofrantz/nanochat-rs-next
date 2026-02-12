@@ -6,7 +6,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::config::{AblateConfig, AppCommand, Mode, SampleConfig, Style, TrainConfig};
 
 #[derive(Debug, Parser)]
-#[command(name = "nanochat-rs-next", version, about = "Rust nanochat benchmark CLI")]
+#[command(
+    name = "nanochat-rs-next",
+    version,
+    about = "Rust nanochat benchmark CLI"
+)]
 struct Cli {
     #[command(subcommand)]
     command: CliCommand,
