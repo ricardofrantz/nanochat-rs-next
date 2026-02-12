@@ -53,7 +53,7 @@
 - **Files**: `src/tensor/mod.rs`
 - **Tests**: Existing tests still pass; throughput improves measurably
 - **Done when**: At least 10% throughput improvement on GPU, or documented why the gap is framework-level
-- [ ] Write throughput benchmark test
+- [x] Write throughput benchmark test
 - [ ] Implement optimizations
 - [ ] Re-run benchmark comparison
 

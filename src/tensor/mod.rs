@@ -1065,6 +1065,21 @@ mod tests {
     }
 
     #[test]
+    fn train_reports_finite_throughput_metrics() {
+        let zero_step = train_from_text("abababababababab", 0, 11, Style::Classic, true, false)
+            .expect("zero-step metrics");
+        assert_eq!(zero_step.steps_per_sec, 0.0);
+        assert_eq!(zero_step.tokens_per_sec, 0.0);
+
+        let trained = train_from_text("abababababababab", 8, 11, Style::Classic, true, false)
+            .expect("trained metrics");
+        assert!(trained.steps_per_sec.is_finite());
+        assert!(trained.tokens_per_sec.is_finite());
+        assert!(trained.steps_per_sec > 0.0);
+        assert!(trained.tokens_per_sec > 0.0);
+    }
+
+    #[test]
     fn train_uses_split_and_reports_validation_loss() {
         let text = "abcdefghijklmnopqrstuvwxyz";
         let metrics = train_from_text(text, 5, 29, Style::Classic, true, false).expect("metrics");
