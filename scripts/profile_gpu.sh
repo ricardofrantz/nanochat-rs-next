@@ -49,9 +49,14 @@ SUMMARY_TXT="${RUN_DIR}/summary.txt"
 NVIDIA_PRE="${RUN_DIR}/nvidia_smi_pre.txt"
 NVIDIA_POST="${RUN_DIR}/nvidia_smi_post.txt"
 
-if command -v nvidia-smi >/dev/null 2>&1; then
-  nvidia-smi --query-gpu=timestamp,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader >"${NVIDIA_PRE}" || true
-fi
+capture_gpu_snapshot() {
+  local output_file="$1"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=timestamp,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader >"${output_file}" || true
+  fi
+}
+
+capture_gpu_snapshot "${NVIDIA_PRE}"
 
 BENCH_CMD=(
   python3 scripts/benchmark_karpathy.py
@@ -92,9 +97,7 @@ echo
 
 "${BENCH_CMD[@]}" | tee "${RUN_LOG}"
 
-if command -v nvidia-smi >/dev/null 2>&1; then
-  nvidia-smi --query-gpu=timestamp,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader >"${NVIDIA_POST}" || true
-fi
+capture_gpu_snapshot "${NVIDIA_POST}"
 
 BENCH_JSON="$(sed -n 's/^benchmark complete: //p' "${RUN_LOG}" | tail -n1)"
 if [[ -z "${BENCH_JSON}" ]]; then

@@ -33,6 +33,7 @@ EXTERNAL_DIR = REPO_ROOT / "external"
 DEFAULT_TORCH_INDEX = "https://download.pytorch.org/whl/cu128"
 DEFAULT_TORCH_FALLBACK_INDEX = "https://download.pytorch.org/whl/cu126"
 DEFAULT_NANOCHAT_PINNED_REF = "2f096867244e3d00a50284d1be05fa3f5dcfb84b"
+GPU_BACKEND_HINTS = ("tch", "candle", "wgpu", "cuda", "metal", "vulkan", "opencl", "burn")
 
 
 def run_bash(
@@ -236,8 +237,7 @@ def parse_ours_features(ours_cargo_features: str) -> set[str]:
 
 def detect_requested_gpu_backend(ours_cargo_features: str) -> dict[str, Any]:
     ours_features = parse_ours_features(ours_cargo_features)
-    hints = ["tch", "candle", "wgpu", "cuda", "metal", "vulkan", "opencl", "burn"]
-    matched = [hint for hint in hints if any(hint in feature for feature in ours_features)]
+    matched = [hint for hint in GPU_BACKEND_HINTS if any(hint in feature for feature in ours_features)]
     return {
         "gpu_backend_detected": bool(matched),
         "backend_hints": matched,
@@ -247,8 +247,7 @@ def detect_requested_gpu_backend(ours_cargo_features: str) -> dict[str, Any]:
 
 def detect_repo_gpu_backend() -> dict[str, Any]:
     cargo_toml = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8").lower()
-    hints = ["tch", "candle", "wgpu", "cuda", "metal", "vulkan", "opencl", "burn"]
-    matched = [hint for hint in hints if hint in cargo_toml]
+    matched = [hint for hint in GPU_BACKEND_HINTS if hint in cargo_toml]
     return {
         "gpu_backend_detected": bool(matched),
         "backend_hints": matched,

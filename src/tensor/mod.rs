@@ -227,25 +227,14 @@ impl TensorBigram {
         }
 
         if self.tie_lm_head {
-            for (row_idx, grad) in logits_grad.iter().copied().enumerate() {
-                if grad == 0.0 {
-                    continue;
-                }
-                let scaled_lr = learning_rate * grad;
-                for (col_idx, hidden_value) in hidden_norm.iter().enumerate() {
-                    self.token_embedding[row_idx][col_idx] -= scaled_lr * hidden_value;
-                }
-            }
+            apply_projection_gradient(
+                &mut self.token_embedding,
+                &logits_grad,
+                &hidden_norm,
+                learning_rate,
+            );
         } else if let Some(lm_head) = self.lm_head.as_mut() {
-            for (row_idx, grad) in logits_grad.iter().copied().enumerate() {
-                if grad == 0.0 {
-                    continue;
-                }
-                let scaled_lr = learning_rate * grad;
-                for (col_idx, hidden_value) in hidden_norm.iter().enumerate() {
-                    lm_head[row_idx][col_idx] -= scaled_lr * hidden_value;
-                }
-            }
+            apply_projection_gradient(lm_head, &logits_grad, &hidden_norm, learning_rate);
         }
 
         let hidden_grad = if let Some(hidden_original) = hidden_for_rmsnorm_backward.as_ref() {
@@ -779,6 +768,23 @@ fn softmax_probs_and_loss(logits: &[f64], target_id: usize) -> (Vec<f64>, f64) {
     let target_prob = probs[target_id];
     let loss = -(target_prob + LOG_EPS).ln();
     (probs, loss)
+}
+
+fn apply_projection_gradient(
+    projection_rows: &mut [Vec<f64>],
+    logits_grad: &[f64],
+    hidden_norm: &[f64],
+    learning_rate: f64,
+) {
+    for (row, grad) in projection_rows.iter_mut().zip(logits_grad.iter().copied()) {
+        if grad == 0.0 {
+            continue;
+        }
+        let scaled_lr = learning_rate * grad;
+        for (weight, hidden_value) in row.iter_mut().zip(hidden_norm.iter().copied()) {
+            *weight -= scaled_lr * hidden_value;
+        }
+    }
 }
 
 fn build_transition_counts(vocab_size: usize, pairs: &[(usize, usize)]) -> Vec<Vec<u64>> {
