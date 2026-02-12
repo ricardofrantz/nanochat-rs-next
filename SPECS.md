@@ -57,7 +57,7 @@ Strategy: fork-and-converge.
 
 Current codebase anchors:
 1. CLI and config: `src/cli.rs`, `src/config.rs`.
-2. Scalar path: `src/scalar/*`.
+2. Scalar path: `src/scalar/*` (`bigram` default + opt-in `mini-gpt` parity path).
 3. Tensor path: `src/tensor/mod.rs`.
 4. Data/tokenizer baseline: `src/data/*`.
 5. Benchmark harness: `scripts/benchmark_karpathy.py`.

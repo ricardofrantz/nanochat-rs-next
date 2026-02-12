@@ -17,6 +17,21 @@ impl fmt::Display for Mode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelKind {
+    Bigram,
+    MiniGpt,
+}
+
+impl fmt::Display for ModelKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bigram => write!(f, "bigram"),
+            Self::MiniGpt => write!(f, "mini-gpt"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Style {
     Classic,
     Futuristic,
@@ -34,6 +49,7 @@ impl fmt::Display for Style {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrainConfig {
     pub mode: Mode,
+    pub model_kind: ModelKind,
     pub style: Style,
     pub tie_lm_head: bool,
     pub input_rmsnorm: bool,
@@ -45,6 +61,7 @@ pub struct TrainConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SampleConfig {
     pub mode: Mode,
+    pub model_kind: ModelKind,
     pub style: Style,
     pub temperature: f64,
     pub max_new_tokens: usize,

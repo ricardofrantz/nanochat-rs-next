@@ -1,4 +1,5 @@
 mod bigram;
+mod minigpt;
 pub mod value;
 
 use std::fmt;
@@ -7,8 +8,9 @@ use std::time::Instant;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::config::{SampleConfig, Style, TrainConfig};
+use crate::config::{ModelKind, SampleConfig, Style, TrainConfig};
 use crate::data::{self, TokenizerError};
+use crate::eval::EvalGuardError;
 
 use self::bigram::{ScalarBigram, build_transition_counts, sample_index};
 
@@ -22,6 +24,7 @@ synthetic pilots chart wormhole routes beyond saturn.\n";
 
 #[derive(Debug, Clone)]
 pub struct TrainMetrics {
+    pub model_kind: ModelKind,
     pub style: Style,
     pub tie_lm_head: bool,
     pub input_rmsnorm: bool,
@@ -40,7 +43,8 @@ impl fmt::Display for TrainMetrics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "mode=scalar style={} tie_lm_head={} input_rmsnorm={} params={} steps={} final_loss={:.6} mean_loss_last_{}={:.6} steps_per_sec={:.2} tokens_per_sec={:.2} vocab_size={} train_tokens={}",
+            "mode=scalar model_kind={} style={} tie_lm_head={} input_rmsnorm={} params={} steps={} final_loss={:.6} mean_loss_last_{}={:.6} steps_per_sec={:.2} tokens_per_sec={:.2} vocab_size={} train_tokens={}",
+            self.model_kind,
             self.style,
             self.tie_lm_head,
             self.input_rmsnorm,
@@ -61,6 +65,7 @@ impl fmt::Display for TrainMetrics {
 pub enum ScalarError {
     Io(std::io::Error),
     Tokenizer(TokenizerError),
+    EvalGuard(EvalGuardError),
     EmptyDataset,
     InvalidTemperature(f64),
 }
@@ -70,6 +75,7 @@ impl fmt::Display for ScalarError {
         match self {
             Self::Io(err) => write!(f, "{err}"),
             Self::Tokenizer(err) => write!(f, "{err}"),
+            Self::EvalGuard(err) => write!(f, "{err}"),
             Self::EmptyDataset => write!(f, "dataset must contain at least one token pair"),
             Self::InvalidTemperature(value) => {
                 write!(f, "temperature must be finite and > 0, got {value}")
@@ -92,28 +98,54 @@ impl From<TokenizerError> for ScalarError {
     }
 }
 
+impl From<EvalGuardError> for ScalarError {
+    fn from(err: EvalGuardError) -> Self {
+        Self::EvalGuard(err)
+    }
+}
+
 pub fn train(config: &TrainConfig) -> Result<TrainMetrics, ScalarError> {
     let base_text = data::load_text(&config.data_path)?;
-    train_from_text(
-        &base_text,
-        config.steps,
-        config.seed,
-        config.style,
-        config.tie_lm_head,
-        config.input_rmsnorm,
-    )
+    match config.model_kind {
+        ModelKind::Bigram => train_from_text(
+            &base_text,
+            config.steps,
+            config.seed,
+            config.style,
+            config.tie_lm_head,
+            config.input_rmsnorm,
+        ),
+        ModelKind::MiniGpt => minigpt::train_from_text(
+            &base_text,
+            config.steps,
+            config.seed,
+            config.style,
+            config.tie_lm_head,
+            config.input_rmsnorm,
+        ),
+    }
 }
 
 pub fn sample(config: &SampleConfig) -> Result<String, ScalarError> {
     let base_text = data::load_text(&config.data_path)?;
-    sample_from_text(
-        &base_text,
-        &config.prompt,
-        config.max_new_tokens,
-        config.temperature,
-        config.seed,
-        config.style,
-    )
+    match config.model_kind {
+        ModelKind::Bigram => sample_from_text(
+            &base_text,
+            &config.prompt,
+            config.max_new_tokens,
+            config.temperature,
+            config.seed,
+            config.style,
+        ),
+        ModelKind::MiniGpt => minigpt::sample_from_text(
+            &base_text,
+            &config.prompt,
+            config.max_new_tokens,
+            config.temperature,
+            config.seed,
+            config.style,
+        ),
+    }
 }
 
 fn train_from_text(
@@ -164,6 +196,7 @@ fn train_from_text(
         .expect("losses contains one element when steps=0");
 
     Ok(TrainMetrics {
+        model_kind: ModelKind::Bigram,
         style,
         tie_lm_head,
         input_rmsnorm,

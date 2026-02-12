@@ -98,6 +98,10 @@ cargo test
 cargo run --release -- train --mode scalar --steps 500
 cargo run --release -- sample --mode scalar --temperature 0.8 --max-new-tokens 120
 
+# scalar mini-gpt parity path (opt-in)
+cargo run --release -- train --mode scalar --model-kind mini-gpt --style classic --steps 200
+cargo run --release -- sample --mode scalar --model-kind mini-gpt --style classic --temperature 0.8 --max-new-tokens 120
+
 # tensor path (CPU fallback, optional GPU with tch backend)
 cargo run --release -- train --mode tensor --steps 500
 LIBTORCH_USE_PYTORCH=1 cargo run --release --features tch-backend -- train --mode tensor --steps 500
@@ -128,6 +132,7 @@ Artifacts are stored in `results/`.
 
 - CLI with `train`, `sample`, and `ablate` flows exists.
 - Scalar and tensor codepaths are present.
+- Scalar now supports `--model-kind bigram|mini-gpt` (default `bigram`).
 - GPU-oriented benchmark scripts and Colab workflow are included.
 - Next major push: stronger parity/stability tests and measurable speed wins.
 

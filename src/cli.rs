@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::config::{AblateConfig, AppCommand, Mode, SampleConfig, Style, TrainConfig};
+use crate::config::{AblateConfig, AppCommand, Mode, ModelKind, SampleConfig, Style, TrainConfig};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -30,6 +30,12 @@ enum CliMode {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliModelKind {
+    Bigram,
+    MiniGpt,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliStyle {
     Classic,
     Futuristic,
@@ -40,6 +46,15 @@ impl From<CliMode> for Mode {
         match mode {
             CliMode::Scalar => Self::Scalar,
             CliMode::Tensor => Self::Tensor,
+        }
+    }
+}
+
+impl From<CliModelKind> for ModelKind {
+    fn from(model_kind: CliModelKind) -> Self {
+        match model_kind {
+            CliModelKind::Bigram => Self::Bigram,
+            CliModelKind::MiniGpt => Self::MiniGpt,
         }
     }
 }
@@ -57,6 +72,8 @@ impl From<CliStyle> for Style {
 struct TrainArgs {
     #[arg(long, value_enum, default_value_t = CliMode::Scalar)]
     mode: CliMode,
+    #[arg(long, value_enum, default_value_t = CliModelKind::Bigram)]
+    model_kind: CliModelKind,
     #[arg(long, value_enum, default_value_t = CliStyle::Futuristic)]
     style: CliStyle,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -75,6 +92,8 @@ struct TrainArgs {
 struct SampleArgs {
     #[arg(long, value_enum, default_value_t = CliMode::Scalar)]
     mode: CliMode,
+    #[arg(long, value_enum, default_value_t = CliModelKind::Bigram)]
+    model_kind: CliModelKind,
     #[arg(long, value_enum, default_value_t = CliStyle::Futuristic)]
     style: CliStyle,
     #[arg(long, default_value_t = 0.8)]
@@ -118,6 +137,7 @@ fn from_cli(cli: Cli) -> AppCommand {
     match cli.command {
         CliCommand::Train(args) => AppCommand::Train(TrainConfig {
             mode: args.mode.into(),
+            model_kind: args.model_kind.into(),
             style: args.style.into(),
             tie_lm_head: args.tie_lm_head,
             input_rmsnorm: args.input_rmsnorm,
@@ -127,6 +147,7 @@ fn from_cli(cli: Cli) -> AppCommand {
         }),
         CliCommand::Sample(args) => AppCommand::Sample(SampleConfig {
             mode: args.mode.into(),
+            model_kind: args.model_kind.into(),
             style: args.style.into(),
             temperature: args.temperature,
             max_new_tokens: args.max_new_tokens,
@@ -157,6 +178,7 @@ mod tests {
         };
 
         assert_eq!(config.mode, Mode::Scalar);
+        assert_eq!(config.model_kind, ModelKind::Bigram);
         assert_eq!(config.style, Style::Futuristic);
         assert!(config.tie_lm_head);
         assert!(!config.input_rmsnorm);
@@ -206,6 +228,7 @@ mod tests {
         };
 
         assert_eq!(config.mode, Mode::Scalar);
+        assert_eq!(config.model_kind, ModelKind::Bigram);
         assert_eq!(config.style, Style::Classic);
         assert!((config.temperature - 0.6).abs() < 1e-12);
         assert_eq!(config.max_new_tokens, 64);
@@ -222,6 +245,7 @@ mod tests {
         };
 
         assert_eq!(config.mode, Mode::Scalar);
+        assert_eq!(config.model_kind, ModelKind::Bigram);
         assert_eq!(config.style, Style::Futuristic);
         assert!((config.temperature - 0.8).abs() < 1e-12);
         assert_eq!(config.max_new_tokens, 200);
@@ -248,5 +272,16 @@ mod tests {
         assert_eq!(config.steps, 500);
         assert_eq!(config.data_path, PathBuf::from("input.txt"));
         assert_eq!(config.seed, 1337);
+    }
+
+    #[test]
+    fn parses_mini_gpt_model_kind() {
+        let command =
+            try_command_from_iter(["nanochat-rs-next", "train", "--model-kind", "mini-gpt"])
+                .expect("valid train command");
+        let AppCommand::Train(config) = command else {
+            panic!("expected train command");
+        };
+        assert_eq!(config.model_kind, ModelKind::MiniGpt);
     }
 }
