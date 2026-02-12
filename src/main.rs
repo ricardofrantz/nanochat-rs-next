@@ -1,6 +1,6 @@
 use std::process;
 
-use microgpt_rs_lab::{cli, config::AppCommand, config::Mode, experiments, scalar, tensor};
+use nanochat_rs_next::{cli, config::AppCommand, config::Mode, experiments, scalar, tensor};
 
 fn main() {
     let command = cli::parse_command();

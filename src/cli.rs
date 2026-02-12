@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::config::{AblateConfig, AppCommand, Mode, SampleConfig, Style, TrainConfig};
 
 #[derive(Debug, Parser)]
-#[command(name = "microgpt-rs-lab", version, about = "Rust microGPT lab CLI")]
+#[command(name = "nanochat-rs-next", version, about = "Rust nanochat benchmark CLI")]
 struct Cli {
     #[command(subcommand)]
     command: CliCommand,
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn parses_train_defaults() {
-        let command = try_command_from_iter(["microgpt-rs-lab", "train"]).expect("valid command");
+        let command = try_command_from_iter(["nanochat-rs-next", "train"]).expect("valid command");
         let AppCommand::Train(config) = command else {
             panic!("expected train command");
         };
@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn parses_train_variant_overrides() {
         let command = try_command_from_iter([
-            "microgpt-rs-lab",
+            "nanochat-rs-next",
             "train",
             "--tie-lm-head=false",
             "--input-rmsnorm=true",
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn parses_sample_overrides() {
         let command = try_command_from_iter([
-            "microgpt-rs-lab",
+            "nanochat-rs-next",
             "sample",
             "--mode",
             "scalar",
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn parses_sample_defaults() {
         let command =
-            try_command_from_iter(["microgpt-rs-lab", "sample"]).expect("valid sample command");
+            try_command_from_iter(["nanochat-rs-next", "sample"]).expect("valid sample command");
         let AppCommand::Sample(config) = command else {
             panic!("expected sample command");
         };
@@ -228,14 +228,14 @@ mod tests {
 
     #[test]
     fn supports_help_flag() {
-        let err = try_command_from_iter(["microgpt-rs-lab", "--help"]).expect_err("help exits");
+        let err = try_command_from_iter(["nanochat-rs-next", "--help"]).expect_err("help exits");
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
     }
 
     #[test]
     fn parses_ablate_defaults() {
         let command =
-            try_command_from_iter(["microgpt-rs-lab", "ablate"]).expect("valid ablate command");
+            try_command_from_iter(["nanochat-rs-next", "ablate"]).expect("valid ablate command");
         let AppCommand::Ablate(config) = command else {
             panic!("expected ablate command");
         };

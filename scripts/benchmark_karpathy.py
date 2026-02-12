@@ -8,9 +8,8 @@ Outputs:
 - results/benchmark_karpathy_<timestamp>_logs/
 
 Usage:
-  python3 scripts/benchmark_karpathy.py --baseline nanogpt --install-deps
   python3 scripts/benchmark_karpathy.py --baseline nanochat --install-deps
-  python3 scripts/benchmark_karpathy.py --baseline both --install-deps --run-ours-scalar-fallback
+  python3 scripts/benchmark_karpathy.py --baseline nanochat --install-deps --run-ours-scalar-fallback
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ import os
 import pathlib
 import re
 import shlex
-import statistics
 import subprocess
 import sys
 import time
@@ -372,98 +370,6 @@ def run_ours_scalar(args: argparse.Namespace, log_dir: pathlib.Path, dataset_pat
     }
 
 
-def ensure_nanogpt_deps(
-    install_deps: bool,
-    log_dir: pathlib.Path,
-    index_url: str,
-    fallback_index_url: str,
-) -> None:
-    if not install_deps:
-        return
-    install_python_torch_cuda(
-        install_deps=True,
-        log_dir=log_dir,
-        index_url=index_url,
-        fallback_index_url=fallback_index_url,
-    )
-    result = run_bash(
-        "python3 -m pip install --upgrade pip && "
-        "python3 -m pip install numpy transformers datasets tiktoken wandb tqdm"
-    )
-    write_command_log(log_dir, "install_nanogpt_other_deps", result)
-
-
-def run_nanogpt(args: argparse.Namespace, log_dir: pathlib.Path, nanogpt_repo: pathlib.Path) -> dict[str, Any]:
-    ensure_nanogpt_deps(
-        args.install_deps,
-        log_dir,
-        args.torch_pip_index_url,
-        args.torch_pip_fallback_index_url,
-    )
-
-    prepare = run_bash("python3 data/shakespeare_char/prepare.py", cwd=nanogpt_repo)
-    write_command_log(log_dir, "nanogpt_prepare", prepare)
-
-    out_dir = nanogpt_repo / "out-microgpt-bench"
-    train_cmd = (
-        "python3 train.py config/train_shakespeare_char.py "
-        "--device=cuda "
-        "--compile=False "
-        f"--max_iters={args.nanogpt_max_iters} "
-        f"--lr_decay_iters={args.nanogpt_max_iters} "
-        f"--eval_interval={args.nanogpt_eval_interval} "
-        f"--eval_iters={args.nanogpt_eval_iters} "
-        f"--log_interval={args.nanogpt_log_interval} "
-        f"--batch_size={args.nanogpt_batch_size} "
-        f"--block_size={args.nanogpt_block_size} "
-        f"--n_layer={args.nanogpt_n_layer} "
-        f"--n_head={args.nanogpt_n_head} "
-        f"--n_embd={args.nanogpt_n_embd} "
-        "--dropout=0.0 "
-        "--wandb_log=False "
-        f"--out_dir={shlex.quote(str(out_dir))}"
-    )
-    train = run_bash(train_cmd, cwd=nanogpt_repo)
-    write_command_log(log_dir, "nanogpt_train", train)
-
-    eval_re = re.compile(r"step\s+(\d+):\s+train loss\s+([0-9.]+),\s+val loss\s+([0-9.]+)")
-    iter_re = re.compile(r"iter\s+(\d+):\s+loss\s+([0-9.]+),\s+time\s+([0-9.]+)ms,\s+mfu\s+([-0-9.]+)%")
-
-    eval_rows = [
-        {
-            "step": int(m.group(1)),
-            "train_loss": float(m.group(2)),
-            "val_loss": float(m.group(3)),
-        }
-        for m in eval_re.finditer(train["output"])
-    ]
-    iter_rows = [
-        {
-            "iter": int(m.group(1)),
-            "loss": float(m.group(2)),
-            "iter_ms": float(m.group(3)),
-            "mfu_percent": float(m.group(4)),
-        }
-        for m in iter_re.finditer(train["output"])
-    ]
-    iter_ms = [row["iter_ms"] for row in iter_rows]
-    median_iter_ms = statistics.median(iter_ms) if iter_ms else None
-    max_iter_ms = max(iter_ms) if iter_ms else None
-
-    return {
-        "status": "ok",
-        "returncode": train["returncode"],
-        "elapsed_sec": train["elapsed_sec"],
-        "commit": git_commit(nanogpt_repo),
-        "dataset": "shakespeare_char",
-        "eval_rows": eval_rows[-5:],
-        "last_eval": eval_rows[-1] if eval_rows else None,
-        "last_iter": iter_rows[-1] if iter_rows else None,
-        "median_iter_ms": median_iter_ms,
-        "max_iter_ms": max_iter_ms,
-    }
-
-
 def ensure_uv(install_deps: bool, log_dir: pathlib.Path) -> None:
     if not install_deps:
         return
@@ -569,10 +475,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
         lines.append(f"- GPU(s): `{'; '.join(d['name'] for d in summary['gpu']['devices'])}`")
     lines.append(f"- Ours dataset: `{summary['ours_data_path']}`")
     lines.append(f"- Ours cargo features: `{summary['args']['ours_cargo_features']}`")
-    lines.append(f"- nanoGPT ref: `{summary['args']['nanogpt_ref']}`")
     lines.append(f"- nanochat ref: `{summary['args']['nanochat_ref']}`")
-    if summary.get("resolved_refs", {}).get("nanogpt"):
-        lines.append(f"- nanoGPT resolved ref: `{summary['resolved_refs']['nanogpt']}`")
     if summary.get("resolved_refs", {}).get("nanochat"):
         lines.append(f"- nanochat resolved ref: `{summary['resolved_refs']['nanochat']}`")
     if summary.get("python_torch"):
@@ -616,21 +519,6 @@ def render_markdown(summary: dict[str, Any]) -> str:
             lines.append(f"- Tokens/sec: `{metrics.get('tokens_per_sec')}`")
         lines.append("")
 
-    nanogpt = summary["runs"].get("nanogpt")
-    if nanogpt:
-        lines.append("## nanoGPT")
-        lines.append("")
-        lines.append(f"- Commit: `{nanogpt['commit']}`")
-        lines.append(f"- Elapsed: `{nanogpt['elapsed_sec']:.3f}s`")
-        last_eval = nanogpt.get("last_eval")
-        if last_eval:
-            lines.append(
-                f"- Last eval: `step={last_eval['step']} train_loss={last_eval['train_loss']:.4f} val_loss={last_eval['val_loss']:.4f}`"
-            )
-        if nanogpt.get("median_iter_ms") is not None:
-            lines.append(f"- Median iter time: `{nanogpt['median_iter_ms']:.2f} ms`")
-        lines.append("")
-
     nanochat = summary["runs"].get("nanochat")
     if nanochat:
         lines.append("## nanochat")
@@ -654,16 +542,10 @@ def render_markdown(summary: dict[str, Any]) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="GPU-first benchmark against nanoGPT/nanochat.")
-    parser.add_argument("--baseline", choices=["nanogpt", "nanochat", "both"], default="nanochat")
+    parser = argparse.ArgumentParser(description="GPU-first benchmark against nanochat.")
+    parser.add_argument("--baseline", choices=["nanochat"], default="nanochat")
     parser.add_argument("--require-gpu", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--install-deps", action="store_true")
-    parser.add_argument(
-        "--nanogpt-ref",
-        type=str,
-        default="auto",
-        help="git ref to checkout for nanoGPT (branch/tag/sha), default auto=origin/HEAD",
-    )
     parser.add_argument(
         "--nanochat-ref",
         type=str,
@@ -682,16 +564,6 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TORCH_FALLBACK_INDEX,
     )
     parser.add_argument("--run-ours-scalar-fallback", action="store_true")
-
-    parser.add_argument("--nanogpt-max-iters", type=int, default=120)
-    parser.add_argument("--nanogpt-eval-interval", type=int, default=30)
-    parser.add_argument("--nanogpt-eval-iters", type=int, default=30)
-    parser.add_argument("--nanogpt-log-interval", type=int, default=10)
-    parser.add_argument("--nanogpt-batch-size", type=int, default=32)
-    parser.add_argument("--nanogpt-block-size", type=int, default=128)
-    parser.add_argument("--nanogpt-n-layer", type=int, default=4)
-    parser.add_argument("--nanogpt-n-head", type=int, default=4)
-    parser.add_argument("--nanogpt-n-embd", type=int, default=128)
 
     parser.add_argument("--nanochat-num-shards", type=int, default=1)
     parser.add_argument("--nanochat-max-chars", type=int, default=20_000_000)
@@ -750,17 +622,7 @@ def main() -> int:
     if args.run_ours_scalar_fallback:
         summary["runs"]["ours_scalar"] = run_ours_scalar(args, logs_dir, ours_data_path)
 
-    if args.baseline in {"nanogpt", "both"}:
-        nanogpt_repo, nanogpt_resolved_ref = ensure_repo(
-            "https://github.com/karpathy/nanoGPT",
-            "nanoGPT",
-            args.nanogpt_ref,
-            logs_dir,
-        )
-        summary["resolved_refs"]["nanogpt"] = nanogpt_resolved_ref
-        summary["runs"]["nanogpt"] = run_nanogpt(args, logs_dir, nanogpt_repo)
-
-    if args.baseline in {"nanochat", "both"}:
+    if args.baseline == "nanochat":
         nanochat_repo, nanochat_resolved_ref = ensure_repo(
             "https://github.com/karpathy/nanochat",
             "nanochat",

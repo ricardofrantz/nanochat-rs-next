@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Colab helper for GPU benchmark runs against nanoGPT / nanochat.
+# Colab helper for GPU benchmark runs against nanochat.
 #
 # Usage (from repo root):
 #   bash scripts/colab_gpu_benchmark.sh
-#   BASELINE=nanogpt bash scripts/colab_gpu_benchmark.sh
-#   BASELINE=both bash scripts/colab_gpu_benchmark.sh
-#   PROFILE=full BASELINE=both bash scripts/colab_gpu_benchmark.sh
+#   PROFILE=full BASELINE=nanochat bash scripts/colab_gpu_benchmark.sh
 #   BASELINE=nanochat EXTRA_ARGS="--nanochat-num-iterations 30" bash scripts/colab_gpu_benchmark.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-BASELINE="${BASELINE:-nanogpt}"
+BASELINE="${BASELINE:-nanochat}"
 PROFILE="${PROFILE:-auto}" # auto|quick|full
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 TORCH_PIP_INDEX_URL="${TORCH_PIP_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
@@ -22,8 +20,12 @@ TORCH_PIP_FALLBACK_INDEX_URL="${TORCH_PIP_FALLBACK_INDEX_URL:-https://download.p
 OURS_CARGO_FEATURES="${OURS_CARGO_FEATURES:-tch-backend}"
 REQUIRE_GPU="${REQUIRE_GPU:-1}" # 1|0
 RUN_DOCTOR="${RUN_DOCTOR:-1}" # 1|0
-NANOGPT_REF="${NANOGPT_REF:-auto}"
 NANOCHAT_REF="${NANOCHAT_REF:-auto}"
+
+if [[ "${BASELINE}" != "nanochat" ]]; then
+  echo "Only BASELINE=nanochat is supported in this repo."
+  exit 1
+fi
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "GPU runtime required. In Colab: Runtime -> Change runtime type -> GPU."
@@ -58,13 +60,12 @@ if [[ "${PROFILE}" == "auto" ]]; then
   fi
 fi
 
-echo "Using PROFILE=${PROFILE} BASELINE=${BASELINE} NANOGPT_REF=${NANOGPT_REF} NANOCHAT_REF=${NANOCHAT_REF}"
+echo "Using PROFILE=${PROFILE} BASELINE=${BASELINE} NANOCHAT_REF=${NANOCHAT_REF}"
 
 ARGS=(
   --baseline "${BASELINE}"
   --install-deps
   --ours-cargo-features "${OURS_CARGO_FEATURES}"
-  --nanogpt-ref "${NANOGPT_REF}"
   --nanochat-ref "${NANOCHAT_REF}"
   --torch-pip-index-url "${TORCH_PIP_INDEX_URL}"
   --torch-pip-fallback-index-url "${TORCH_PIP_FALLBACK_INDEX_URL}"
@@ -79,10 +80,6 @@ fi
 if [[ "${PROFILE}" == "quick" ]]; then
   ARGS+=(
     --ours-steps 300
-    --nanogpt-max-iters 80
-    --nanogpt-eval-interval 20
-    --nanogpt-eval-iters 20
-    --nanogpt-log-interval 10
     --nanochat-num-shards 1
     --nanochat-max-chars 10000000
     --nanochat-depth 4

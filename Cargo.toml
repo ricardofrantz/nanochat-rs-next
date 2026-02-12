@@ -1,8 +1,8 @@
 [package]
-name = "microgpt-rs-lab"
+name = "nanochat-rs-next"
 version = "0.1.0"
 edition = "2024"
-description = "Rust microGPT lab with scalar autograd and tensor-style character-level train/sample modes plus ablation reporting."
+description = "Rust-first nanochat continuation for benchmark-driven training, eval, and inference experiments."
 
 [features]
 default = []

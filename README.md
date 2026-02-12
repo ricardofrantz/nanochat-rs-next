@@ -1,145 +1,131 @@
-# microgpt-rs-lab
+# nanochat-rs-next
 
-`microgpt-rs-lab` is a Rust CLI microGPT lab for training and sampling a small character-level language model end-to-end: it tokenizes text with a BOS token, trains a scalar autograd path and a tensor-style path, supports `classic`/`futuristic` styles for generation, and runs ablation sweeps (tied vs untied `lm_head`, with vs without input `rmsnorm`) that write comparable CSV/JSONL metrics in `results/`.
+`nanochat-rs-next` is a Rust-first continuation of [`AntigmaLabs/nanochat-rs`](https://github.com/AntigmaLabs/nanochat-rs), built to go toe-to-toe with [`karpathy/nanochat`](https://github.com/karpathy/nanochat) on speed, quality, and reproducibility.
 
-## Reference
+This is the guiding overview file for the project. Detailed execution scope lives in `SPECS.md`.
 
-This project is directly inspired by Karpathy's implementation:
+## What This Repo Is
 
-- Gist: https://gist.github.com/karpathy/8627fe009c40f57531cb18360106ce95
-- Single-page version: https://karpathy.ai/microgpt.html
+- A practical engineering repo for training/eval/inference experiments in modern Rust.
+- A benchmark-driven effort: every performance claim must be reproducible and comparable to `karpathy/nanochat`.
+- A continuation, not a rewrite-from-scratch for the sake of rewriting.
 
-The intent is not to outgrow the reference quickly, but to preserve its teaching value while making controlled experiments easier in Rust.
+## Lineage and Benchmark Anchors
 
-## Planned Modes
+- Evolving from: `AntigmaLabs/nanochat-rs` (Rust baseline and reusable modules).
+- Benchmarking against: `karpathy/nanochat` (behavior and benchmark source of truth).
+- Scope focus: **nanochat parity and improvements**.
 
-- `scalar`: educational, explicit operations and gradients.
-- `tensor`: backend-accelerated path for throughput experiments (CPU fallback + optional `tch` CUDA backend).
+## Objective
 
-## Planned Experiments
+Build a repo that is:
 
-- tied vs untied `lm_head`
-- with vs without input `rmsnorm`
+1. `better`: equal or lower eval loss at matched training budget.
+2. `faster`: higher throughput and lower time-to-target-loss on the same hardware class.
+3. `safer`: stronger eval/checkpoint stability guarantees.
+4. `reproducible`: pinned refs/seeds and machine-readable benchmark artifacts in `results/`.
 
-## Planned CLI
+## Core Strategy (Fork-and-Converge)
 
-```bash
-cargo run --release -- train --mode scalar --style futuristic --steps 500
-cargo run --release -- train --mode tensor --steps 500
-cargo run --release -- ablate --style futuristic --steps 500
-cargo run --release -- sample --mode scalar --style classic --temperature 0.8 --max-new-tokens 120
-cargo run --release -- sample --mode scalar --style futuristic --temperature 0.8 --max-new-tokens 120
-cargo run --release -- sample --mode tensor --temperature 0.6
-```
+1. Reuse selected components from `nanochat-rs` where that accelerates delivery.
+2. Implement missing training/eval parity contracts natively in this repo.
+3. Keep `karpathy/nanochat` as the comparison baseline for correctness and benchmarks.
+4. Reject changes that improve speed by changing the underlying problem definition.
 
-## Current Status
+## Gaps We Intend to Tackle
 
-Implementation has started:
+1. Eval stability and long-context safety.
+- Example classes: RoPE/cache boundary failures and eval memory growth.
 
-- Phase 0 baseline CLI skeleton is in place (`train`, `sample`, `ablate`).
-- Phase 1 tokenizer/data utilities are implemented with unit tests.
-- Phase 2 scalar autograd `Value` core is implemented with gradient tests.
-- Phase 3 scalar path has a working bigram trainer and sampler.
-- Tensor mode has working train/sample execution; with `--features tch-backend` it trains through `tch` (PyTorch/libtorch) and can use CUDA.
-- Tensor train metrics now report `backend=... device=... using_gpu=...` so GPU usage is explicit.
-- Scalar and tensor train/sample support style modes: `classic` and `futuristic` (default).
-- Ablation now runs all 4 planned variants and persists style-tagged CSV/JSONL files in `results/`.
+2. Checkpoint lifecycle reliability.
+- Ensure save/eval ordering is safe under interruptions.
 
-## Development
+3. Portable runtime profiles.
+- Make CPU/MPS/CUDA behavior explicit with predictable failure modes.
+
+4. Rust-native tokenizer + parity infrastructure.
+- Build robust tokenizer tooling with strict fixture parity.
+
+5. Interop paths for non-Python serving stacks.
+- Define clean export/runtime interfaces for broader deployment use.
+
+6. Transparent benchmark governance.
+- One-command benchmark with pass/fail scorecard (`quality`, `speed`, `reproducibility`).
+
+## Repo Plan
+
+### Phase 1: Parity Foundation
+
+- Stabilize benchmark harness against pinned `karpathy/nanochat` refs.
+- Land tokenizer/model/runtime parity tests.
+- Add regression coverage for known eval/checkpoint failure classes.
+
+### Phase 2: Performance Wins
+
+- Profile hot paths and reduce overhead in training/inference loops.
+- Report before/after results with matched budgets.
+- Keep quality gates enforced.
+
+### Phase 3: Practical Utility
+
+- Expand hardware profiles and environment diagnostics.
+- Improve contributor workflow and issue templates.
+- Package reusable Rust components (tokenizer/metrics/parity helpers).
+
+## Engineering Rules
+
+- No feature is complete without tests.
+- No optimization is accepted without benchmark evidence.
+- No benchmark claim is accepted without reproducibility metadata.
+- Prefer minimal, composable Rust implementations over framework-heavy designs.
+
+## Success Criteria
+
+A change is considered successful when:
+
+1. Tests pass (`cargo test`).
+2. Behavior remains compatible with target parity expectations.
+3. Benchmark evidence is recorded when runtime-sensitive code changes.
+4. Artifact outputs are auditable (`results/*.json`, `results/*.md`).
+
+## Quick Start
 
 ```bash
 cargo check
 cargo test
 
-# tensor backend with tch/libtorch (uses GPU when available)
+# scalar path
+cargo run --release -- train --mode scalar --steps 500
+cargo run --release -- sample --mode scalar --temperature 0.8 --max-new-tokens 120
+
+# tensor path (CPU fallback, optional GPU with tch backend)
+cargo run --release -- train --mode tensor --steps 500
 LIBTORCH_USE_PYTORCH=1 cargo run --release --features tch-backend -- train --mode tensor --steps 500
 ```
 
-## NVIDIA-First Mode
-
-For professional GPU runs, use the `tch` backend and pin CUDA wheel indexes:
+## Benchmark Workflow
 
 ```bash
-# diagnose environment first
-bash scripts/nvidia_doctor.sh
-
-# run tensor training with nvidia backend
-LIBTORCH_USE_PYTORCH=1 LIBTORCH_BYPASS_VERSION_CHECK=1 cargo run --release --features tch-backend -- train --mode tensor --steps 500
-```
-
-`nvidia_doctor.sh` fails by default when CUDA is unavailable. For info-only checks on non-GPU laptops:
-
-```bash
-REQUIRE_GPU=0 bash scripts/nvidia_doctor.sh
-```
-
-On macOS, if you see `libtorch_cpu.dylib` load errors, prepend:
-
-```bash
-DYLD_LIBRARY_PATH="$(python3 - <<'PY'
-import os, torch
-print(os.path.join(os.path.dirname(torch.__file__), 'lib'))
-PY
-)" LIBTORCH_USE_PYTORCH=1 LIBTORCH_BYPASS_VERSION_CHECK=1 cargo run --release --features tch-backend -- train --mode tensor --steps 500
-```
-
-## GPU Benchmark (Colab-Friendly)
-
-To benchmark this repo against Karpathy baselines (`nanochat` and/or `nanoGPT`) on a GPU runtime:
-
-```bash
-# default baseline/profile: nanogpt + auto (auto chooses quick/full from GPU memory)
+# GPU-first benchmark run
 bash scripts/colab_gpu_benchmark.sh
 
-# faster benchmark against nanoGPT only
-BASELINE=nanogpt bash scripts/colab_gpu_benchmark.sh
+# explicit profile and baseline
+PROFILE=full BASELINE=nanochat bash scripts/colab_gpu_benchmark.sh
 
-# run both baselines
-BASELINE=both bash scripts/colab_gpu_benchmark.sh
-
-# longer/more complete run profile
-PROFILE=full BASELINE=both bash scripts/colab_gpu_benchmark.sh
-
-# pin baseline refs for reproducible comparisons
-NANOGPT_REF=master NANOCHAT_REF=main BASELINE=both bash scripts/colab_gpu_benchmark.sh
+# direct script usage
+python3 scripts/benchmark_karpathy.py --baseline nanochat --install-deps --require-gpu --ours-cargo-features tch-backend
 ```
 
-Raw benchmark artifacts are written to `results/`:
+Artifacts are stored in `results/`.
 
-- `benchmark_karpathy_<timestamp>.json`
-- `benchmark_karpathy_<timestamp>.md`
-- `benchmark_karpathy_<timestamp>_logs/`
+## Project Status (Current)
 
-Direct script usage:
+- CLI with `train`, `sample`, and `ablate` flows exists.
+- Scalar and tensor codepaths are present.
+- GPU-oriented benchmark scripts and Colab workflow are included.
+- Next major push: stronger parity/stability tests and measurable speed wins.
 
-```bash
-python3 scripts/benchmark_karpathy.py --baseline nanochat --install-deps --require-gpu --ours-cargo-features tch-backend --nanochat-ref auto --torch-pip-index-url https://download.pytorch.org/whl/cu128 --torch-pip-fallback-index-url https://download.pytorch.org/whl/cu126
-python3 scripts/benchmark_karpathy.py --baseline nanogpt --install-deps --require-gpu --ours-cargo-features tch-backend --nanogpt-ref auto --torch-pip-index-url https://download.pytorch.org/whl/cu128 --torch-pip-fallback-index-url https://download.pytorch.org/whl/cu126
-python3 scripts/benchmark_karpathy.py --baseline both --install-deps --require-gpu --ours-cargo-features tch-backend --nanogpt-ref auto --nanochat-ref auto --torch-pip-index-url https://download.pytorch.org/whl/cu128 --torch-pip-fallback-index-url https://download.pytorch.org/whl/cu126
-```
+## Sources
 
-### Deploy From Laptop to Colab
-
-From this repo:
-
-```bash
-# 1) commit and push your current state
-git add src/tensor/mod.rs README.md scripts/benchmark_karpathy.py scripts/colab_gpu_benchmark.sh scripts/nvidia_doctor.sh scripts/colab_url.py notebooks/colab_gpu_benchmark.ipynb
-git commit -m "bench: colab gpu workflow"
-git push origin HEAD
-
-# 2) print Colab notebook URL for current branch
-python3 scripts/colab_url.py
-```
-
-Open that URL, set GPU runtime, and run notebook `notebooks/colab_gpu_benchmark.ipynb`.
-
-Notes:
-
-- This harness is GPU-first and requires `nvidia-smi`.
-- It probes `train --mode tensor` for this repo first, compiling with `--features tch-backend` by default.
-- With `--require-gpu` (default), it fails unless our run reports `using_gpu=true` (no silent CPU fallback).
-- It installs NVIDIA PyTorch wheels from a pinned index URL (with fallback) before running benchmarks.
-- Baseline repos can be pinned by ref (`--nanogpt-ref`, `--nanochat-ref`) for reproducible runs.
-- It reports whether a Rust GPU backend appears configured in `Cargo.toml` (heuristic).
-- Optional scalar fallback can be added with `--run-ours-scalar-fallback` for a non-GPU reference run.
+- https://github.com/AntigmaLabs/nanochat-rs
+- https://github.com/karpathy/nanochat
