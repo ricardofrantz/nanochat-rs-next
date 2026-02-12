@@ -765,11 +765,17 @@ fn rmsnorm_backward(input: &[f64], grad_output: &[f64]) -> Vec<f64> {
 
 fn softmax_probs_and_loss(logits: &[f64], target_id: usize) -> (Vec<f64>, f64) {
     let max_logit = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let shifted: Vec<f64> = logits.iter().map(|logit| logit - max_logit).collect();
-    let exp_logits: Vec<f64> = shifted.iter().map(|logit| logit.exp()).collect();
-    let exp_sum: f64 = exp_logits.iter().sum();
+    let mut probs = Vec::with_capacity(logits.len());
+    let mut exp_sum = 0.0;
+    for logit in logits {
+        let exp_value = (logit - max_logit).exp();
+        probs.push(exp_value);
+        exp_sum += exp_value;
+    }
     let inv_sum = 1.0 / exp_sum;
-    let probs: Vec<f64> = exp_logits.iter().map(|value| value * inv_sum).collect();
+    for value in &mut probs {
+        *value *= inv_sum;
+    }
     let target_prob = probs[target_id];
     let loss = -(target_prob + LOG_EPS).ln();
     (probs, loss)
