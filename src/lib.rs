@@ -6,3 +6,4 @@ pub mod eval;
 pub mod experiments;
 pub mod scalar;
 pub mod tensor;
+pub mod training;

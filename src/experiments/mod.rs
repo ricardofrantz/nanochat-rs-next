@@ -4,7 +4,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::{AblateConfig, Mode, ModelKind, Optimizer, TrainConfig};
+use crate::config::{AblateConfig, ModelKind, Mode, Optimizer, RuntimeConfig, TrainConfig};
+use crate::training;
 use crate::scalar::{self, TrainMetrics};
 
 #[derive(Debug, Clone, Copy)]
@@ -188,17 +189,19 @@ pub fn run_ablation(config: &AblateConfig) -> Result<AblationReport, AblationErr
     let mut records = Vec::with_capacity(VARIANTS.len());
     for variant in VARIANTS {
         let train_config = TrainConfig {
-            mode: Mode::Scalar,
-            model_kind: ModelKind::Bigram,
+            runtime: RuntimeConfig {
+                mode: Mode::Scalar,
+                model_kind: ModelKind::Bigram,
+                style: config.style,
+                data_path: config.data_path.clone(),
+                seed: config.seed,
+            },
             optimizer: Optimizer::Sgd,
-            style: config.style,
             tie_lm_head: variant.tie_lm_head,
             input_rmsnorm: variant.input_rmsnorm,
             steps: config.steps,
-            data_path: config.data_path.clone(),
-            seed: config.seed,
             checkpoint_every: 0,
-            checkpoint_dir: PathBuf::from("results/checkpoints"),
+            checkpoint_dir: PathBuf::from(training::DEFAULT_CHECKPOINT_DIR),
         };
         let metrics = scalar::train(&train_config)?;
         records.push(AblationRecord::from_metrics(variant, &metrics, config.seed));

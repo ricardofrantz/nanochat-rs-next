@@ -62,30 +62,31 @@ impl fmt::Display for Optimizer {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TrainConfig {
+pub struct RuntimeConfig {
     pub mode: Mode,
     pub model_kind: ModelKind,
-    pub optimizer: Optimizer,
     pub style: Style,
+    pub data_path: PathBuf,
+    pub seed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrainConfig {
+    pub runtime: RuntimeConfig,
+    pub optimizer: Optimizer,
     pub tie_lm_head: bool,
     pub input_rmsnorm: bool,
     pub steps: usize,
-    pub data_path: PathBuf,
-    pub seed: u64,
     pub checkpoint_every: usize,
     pub checkpoint_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SampleConfig {
-    pub mode: Mode,
-    pub model_kind: ModelKind,
-    pub style: Style,
+    pub runtime: RuntimeConfig,
     pub temperature: f64,
     pub max_new_tokens: usize,
     pub prompt: String,
-    pub data_path: PathBuf,
-    pub seed: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

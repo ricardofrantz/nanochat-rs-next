@@ -1,6 +1,7 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use crate::training;
 use super::value::Value;
 
 const RMS_EPS: f64 = 1e-8;
@@ -157,28 +158,14 @@ pub(crate) fn sample_index(
     temperature: f64,
     rng: &mut StdRng,
 ) -> usize {
-    let exponent = 1.0 / temperature;
-    let mut weights = Vec::with_capacity(transition_counts[context_id].len());
-    for (token_id, count) in transition_counts[context_id].iter().enumerate() {
-        if token_id == bos_id {
-            weights.push(0.0);
-            continue;
-        }
-        let count = (*count).max(1) as f64;
-        weights.push(count.powf(exponent));
-    }
-    weighted_choice(&weights, rng)
+    training::sample_index(transition_counts, context_id, bos_id, temperature, rng)
 }
 
 pub(crate) fn build_transition_counts(
     vocab_size: usize,
     pairs: &[(usize, usize)],
 ) -> Vec<Vec<u64>> {
-    let mut counts = vec![vec![1_u64; vocab_size]; vocab_size];
-    for (context_id, target_id) in pairs {
-        counts[*context_id][*target_id] += 1;
-    }
-    counts
+    training::build_transition_counts(vocab_size, pairs)
 }
 
 fn sum_values(values: &[Value]) -> Value {
@@ -188,31 +175,6 @@ fn sum_values(values: &[Value]) -> Value {
         .expect("sum_values requires at least one value")
         .clone();
     iter.fold(first, |acc, value| acc.add(value))
-}
-
-fn weighted_choice(weights: &[f64], rng: &mut StdRng) -> usize {
-    let mut total = 0.0;
-    for weight in weights {
-        total += *weight;
-    }
-
-    if total <= 0.0 {
-        return 0;
-    }
-
-    let mut sample = rng.gen_range(0.0..total);
-    let mut last_nonzero = 0;
-    for (idx, weight) in weights.iter().enumerate() {
-        if *weight <= 0.0 {
-            continue;
-        }
-        last_nonzero = idx;
-        if sample <= *weight {
-            return idx;
-        }
-        sample -= *weight;
-    }
-    last_nonzero
 }
 
 #[cfg(test)]

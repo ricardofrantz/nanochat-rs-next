@@ -4,8 +4,10 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::config::{
-    AblateConfig, AppCommand, Mode, ModelKind, Optimizer, SampleConfig, Style, TrainConfig,
+    AblateConfig, AppCommand, Mode, ModelKind, Optimizer, RuntimeConfig, SampleConfig, Style,
+    TrainConfig,
 };
+use crate::training;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -87,49 +89,47 @@ impl From<CliOptimizer> for Optimizer {
 }
 
 #[derive(Debug, Args)]
-struct TrainArgs {
+struct RuntimeArgs {
     #[arg(long, value_enum, default_value_t = CliMode::Scalar)]
     mode: CliMode,
     #[arg(long, value_enum, default_value_t = CliModelKind::Bigram)]
     model_kind: CliModelKind,
-    #[arg(long, value_enum, default_value_t = CliOptimizer::Sgd)]
-    optimizer: CliOptimizer,
     #[arg(long, value_enum, default_value_t = CliStyle::Futuristic)]
     style: CliStyle,
+    #[arg(long, default_value = "input.txt")]
+    data: PathBuf,
+    #[arg(long, default_value_t = 1337)]
+    seed: u64,
+}
+
+#[derive(Debug, Args)]
+struct TrainArgs {
+    #[command(flatten)]
+    runtime: RuntimeArgs,
+    #[arg(long, value_enum, default_value_t = CliOptimizer::Sgd)]
+    optimizer: CliOptimizer,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     tie_lm_head: bool,
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     input_rmsnorm: bool,
     #[arg(long, default_value_t = 500)]
     steps: usize,
-    #[arg(long, default_value = "input.txt")]
-    data: PathBuf,
-    #[arg(long, default_value_t = 1337)]
-    seed: u64,
     #[arg(long, default_value_t = 0)]
     checkpoint_every: usize,
-    #[arg(long, default_value = "results/checkpoints")]
+    #[arg(long, default_value = training::DEFAULT_CHECKPOINT_DIR)]
     checkpoint_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
 struct SampleArgs {
-    #[arg(long, value_enum, default_value_t = CliMode::Scalar)]
-    mode: CliMode,
-    #[arg(long, value_enum, default_value_t = CliModelKind::Bigram)]
-    model_kind: CliModelKind,
-    #[arg(long, value_enum, default_value_t = CliStyle::Futuristic)]
-    style: CliStyle,
+    #[command(flatten)]
+    runtime: RuntimeArgs,
     #[arg(long, default_value_t = 0.8)]
     temperature: f64,
     #[arg(long, default_value_t = 200)]
     max_new_tokens: usize,
     #[arg(long, default_value = "")]
     prompt: String,
-    #[arg(long, default_value = "input.txt")]
-    data: PathBuf,
-    #[arg(long, default_value_t = 1337)]
-    seed: u64,
 }
 
 #[derive(Debug, Args)]
@@ -158,29 +158,29 @@ where
 }
 
 fn from_cli(cli: Cli) -> AppCommand {
+    let to_runtime = |args: RuntimeArgs| RuntimeConfig {
+        mode: args.mode.into(),
+        model_kind: args.model_kind.into(),
+        style: args.style.into(),
+        data_path: args.data,
+        seed: args.seed,
+    };
+
     match cli.command {
         CliCommand::Train(args) => AppCommand::Train(TrainConfig {
-            mode: args.mode.into(),
-            model_kind: args.model_kind.into(),
+            runtime: to_runtime(args.runtime),
             optimizer: args.optimizer.into(),
-            style: args.style.into(),
             tie_lm_head: args.tie_lm_head,
             input_rmsnorm: args.input_rmsnorm,
             steps: args.steps,
-            data_path: args.data,
-            seed: args.seed,
             checkpoint_every: args.checkpoint_every,
             checkpoint_dir: args.checkpoint_dir,
         }),
         CliCommand::Sample(args) => AppCommand::Sample(SampleConfig {
-            mode: args.mode.into(),
-            model_kind: args.model_kind.into(),
-            style: args.style.into(),
+            runtime: to_runtime(args.runtime),
             temperature: args.temperature,
             max_new_tokens: args.max_new_tokens,
             prompt: args.prompt,
-            data_path: args.data,
-            seed: args.seed,
         }),
         CliCommand::Ablate(args) => AppCommand::Ablate(AblateConfig {
             style: args.style.into(),
@@ -204,17 +204,19 @@ mod tests {
             panic!("expected train command");
         };
 
-        assert_eq!(config.mode, Mode::Scalar);
-        assert_eq!(config.model_kind, ModelKind::Bigram);
-        assert_eq!(config.optimizer, Optimizer::Sgd);
-        assert_eq!(config.style, Style::Futuristic);
+        assert_eq!(config.runtime.mode, Mode::Scalar);
+        assert_eq!(config.runtime.model_kind, ModelKind::Bigram);
+        assert_eq!(config.runtime.style, Style::Futuristic);
         assert!(config.tie_lm_head);
         assert!(!config.input_rmsnorm);
         assert_eq!(config.steps, 500);
-        assert_eq!(config.data_path, PathBuf::from("input.txt"));
-        assert_eq!(config.seed, 1337);
+        assert_eq!(config.runtime.data_path, PathBuf::from("input.txt"));
+        assert_eq!(config.runtime.seed, 1337);
         assert_eq!(config.checkpoint_every, 0);
-        assert_eq!(config.checkpoint_dir, PathBuf::from("results/checkpoints"));
+        assert_eq!(
+            config.checkpoint_dir,
+            PathBuf::from(training::DEFAULT_CHECKPOINT_DIR)
+        );
     }
 
     #[test]
@@ -255,18 +257,18 @@ mod tests {
             "--seed",
             "7",
         ])
-        .expect("valid command");
+        .expect("valid sample command");
         let AppCommand::Sample(config) = command else {
             panic!("expected sample command");
         };
 
-        assert_eq!(config.mode, Mode::Scalar);
-        assert_eq!(config.model_kind, ModelKind::Bigram);
-        assert_eq!(config.style, Style::Classic);
+        assert_eq!(config.runtime.mode, Mode::Scalar);
+        assert_eq!(config.runtime.model_kind, ModelKind::Bigram);
+        assert_eq!(config.runtime.style, Style::Classic);
         assert!((config.temperature - 0.6).abs() < 1e-12);
         assert_eq!(config.max_new_tokens, 64);
         assert_eq!(config.prompt, "hi");
-        assert_eq!(config.seed, 7);
+        assert_eq!(config.runtime.seed, 7);
     }
 
     #[test]
@@ -277,14 +279,14 @@ mod tests {
             panic!("expected sample command");
         };
 
-        assert_eq!(config.mode, Mode::Scalar);
-        assert_eq!(config.model_kind, ModelKind::Bigram);
-        assert_eq!(config.style, Style::Futuristic);
+        assert_eq!(config.runtime.mode, Mode::Scalar);
+        assert_eq!(config.runtime.model_kind, ModelKind::Bigram);
+        assert_eq!(config.runtime.style, Style::Futuristic);
         assert!((config.temperature - 0.8).abs() < 1e-12);
         assert_eq!(config.max_new_tokens, 200);
         assert_eq!(config.prompt, "");
-        assert_eq!(config.data_path, PathBuf::from("input.txt"));
-        assert_eq!(config.seed, 1337);
+        assert_eq!(config.runtime.data_path, PathBuf::from("input.txt"));
+        assert_eq!(config.runtime.seed, 1337);
     }
 
     #[test]
@@ -315,6 +317,47 @@ mod tests {
         let AppCommand::Train(config) = command else {
             panic!("expected train command");
         };
-        assert_eq!(config.model_kind, ModelKind::MiniGpt);
+        assert_eq!(config.runtime.model_kind, ModelKind::MiniGpt);
+    }
+
+    #[test]
+    fn parses_tensor_mode_and_optimizer() {
+        let command = try_command_from_iter([
+            "nanochat-rs-next",
+            "train",
+            "--mode",
+            "tensor",
+            "--optimizer",
+            "adamw",
+        ])
+        .expect("valid train command");
+        let AppCommand::Train(config) = command else {
+            panic!("expected train command");
+        };
+
+        assert_eq!(config.runtime.mode, Mode::Tensor);
+        assert_eq!(config.optimizer, Optimizer::AdamW);
+    }
+
+    #[test]
+    fn parses_tensor_mode_with_mini_gpt_model_kind() {
+        let command = try_command_from_iter([
+            "nanochat-rs-next",
+            "train",
+            "--mode",
+            "tensor",
+            "--model-kind",
+            "mini-gpt",
+            "--optimizer",
+            "sgd",
+        ])
+        .expect("valid train command");
+        let AppCommand::Train(config) = command else {
+            panic!("expected train command");
+        };
+
+        assert_eq!(config.runtime.mode, Mode::Tensor);
+        assert_eq!(config.runtime.model_kind, ModelKind::MiniGpt);
+        assert_eq!(config.optimizer, Optimizer::Sgd);
     }
 }

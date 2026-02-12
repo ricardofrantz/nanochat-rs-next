@@ -12,6 +12,7 @@ use rand::{Rng, SeedableRng};
 use crate::config::{ModelKind, Optimizer, SampleConfig, Style, TrainConfig};
 use crate::data::{self, TokenizerError};
 use crate::eval::EvalGuardError;
+use crate::training;
 
 use self::bigram::{ScalarBigram, build_transition_counts, sample_index};
 use self::optimizer::{AdamW, AdamWConfig};
@@ -19,20 +20,10 @@ use self::optimizer::{AdamW, AdamWConfig};
 const DEFAULT_LEARNING_RATE: f64 = 0.1;
 const ADAMW_LEARNING_RATE: f64 = 0.03;
 const LOSS_WINDOW: usize = 50;
-pub(super) const VAL_FRACTION: f32 = 0.1;
-const EVAL_EVERY: usize = 20;
-const EVAL_PAIRS: usize = 1024;
-const WARMUP_RATIO: f64 = 0.0;
-const WARMDOWN_RATIO: f64 = 0.5;
-const FINAL_LR_FRAC: f64 = 0.0;
-const FUTURISTIC_CORPUS: &str = "\
-neon skylines hum over orbital transit lanes.\n\
-quantum couriers sync with neural uplinks at dawn.\n\
-autonomous swarms calibrate reactor lattices in silence.\n\
-synthetic pilots chart wormhole routes beyond saturn.\n";
+const EVAL_EVERY: usize = training::EVAL_EVERY;
 
-type TokenPair = (usize, usize);
-type PairSplits = (Vec<TokenPair>, Vec<TokenPair>);
+type TokenPair = training::TokenPair;
+type PairSplits = training::PairSplits;
 
 #[derive(Debug, Clone)]
 pub struct TrainMetrics {
@@ -121,23 +112,24 @@ impl From<EvalGuardError> for ScalarError {
 }
 
 pub fn train(config: &TrainConfig) -> Result<TrainMetrics, ScalarError> {
-    let base_text = data::load_text(&config.data_path)?;
-    match config.model_kind {
+    let runtime = &config.runtime;
+    let base_text = data::load_text(&runtime.data_path)?;
+    match runtime.model_kind {
         ModelKind::Bigram => train_from_text(
             &base_text,
             config.steps,
-            config.seed,
+            runtime.seed,
             config.optimizer,
-            config.style,
+            runtime.style,
             config.tie_lm_head,
             config.input_rmsnorm,
         ),
         ModelKind::MiniGpt => minigpt::train_from_text(
             &base_text,
             config.steps,
-            config.seed,
+            runtime.seed,
             config.optimizer,
-            config.style,
+            runtime.style,
             config.tie_lm_head,
             config.input_rmsnorm,
         ),
@@ -145,48 +137,34 @@ pub fn train(config: &TrainConfig) -> Result<TrainMetrics, ScalarError> {
 }
 
 pub fn sample(config: &SampleConfig) -> Result<String, ScalarError> {
-    let base_text = data::load_text(&config.data_path)?;
-    match config.model_kind {
+    let runtime = &config.runtime;
+    let base_text = data::load_text(&runtime.data_path)?;
+    match runtime.model_kind {
         ModelKind::Bigram => sample_from_text(
             &base_text,
             &config.prompt,
             config.max_new_tokens,
             config.temperature,
-            config.seed,
-            config.style,
+            runtime.seed,
+            runtime.style,
         ),
         ModelKind::MiniGpt => minigpt::sample_from_text(
             &base_text,
             &config.prompt,
             config.max_new_tokens,
             config.temperature,
-            config.seed,
-            config.style,
+            runtime.seed,
+            runtime.style,
         ),
     }
 }
 
 pub(super) fn should_eval(step: usize, total_steps: usize, eval_every: usize) -> bool {
-    if step == total_steps {
-        return true;
-    }
-    eval_every > 0 && step.is_multiple_of(eval_every)
+    training::should_eval(step, total_steps, eval_every)
 }
 
 pub(super) fn lr_multiplier(step: usize, total_steps: usize) -> f64 {
-    if total_steps == 0 {
-        return 1.0;
-    }
-    let warmup_iters = (WARMUP_RATIO * (total_steps as f64)).round() as usize;
-    let warmdown_iters = (WARMDOWN_RATIO * (total_steps as f64)).round() as usize;
-    if warmup_iters > 0 && step < warmup_iters {
-        return (step + 1) as f64 / (warmup_iters as f64);
-    }
-    if warmdown_iters == 0 || step <= total_steps.saturating_sub(warmdown_iters) {
-        return 1.0;
-    }
-    let progress = (total_steps - step) as f64 / (warmdown_iters as f64);
-    progress + (1.0 - progress) * FINAL_LR_FRAC
+    training::lr_multiplier(step, total_steps)
 }
 
 fn train_from_text(
@@ -334,10 +312,7 @@ fn sample_from_text(
 }
 
 fn styled_corpus(base: &str, style: Style) -> String {
-    match style {
-        Style::Classic => base.to_string(),
-        Style::Futuristic => format!("{base}\n{FUTURISTIC_CORPUS}"),
-    }
+    training::styled_corpus(base, style)
 }
 
 fn apply_futuristic_boost(
@@ -345,36 +320,11 @@ fn apply_futuristic_boost(
     tokenizer: &data::Tokenizer,
     bos_id: usize,
 ) {
-    const BOOST: u64 = 400;
-    const PHRASES: [&str; 8] = [
-        "neon",
-        "quantum",
-        "neural",
-        "orbital",
-        "reactor",
-        "wormhole",
-        "autonomous",
-        "synthetic",
-    ];
-
-    for phrase in PHRASES {
-        let Ok(ids) = tokenizer.encode(phrase) else {
-            continue;
-        };
-        if ids.is_empty() {
-            continue;
-        }
-
-        transition_counts[bos_id][ids[0]] += BOOST;
-        for pair in ids.windows(2) {
-            transition_counts[pair[0]][pair[1]] += BOOST;
-        }
-    }
+    training::apply_futuristic_boost(transition_counts, tokenizer, bos_id)
 }
 
 fn eval_pairs_slice(pairs: &[TokenPair]) -> &[TokenPair] {
-    let eval_len = pairs.len().min(EVAL_PAIRS);
-    &pairs[..eval_len]
+    training::eval_pairs_slice(pairs)
 }
 
 fn mean_nll_loss(model: &ScalarBigram, pairs: &[TokenPair]) -> f64 {
@@ -386,26 +336,11 @@ fn mean_nll_loss(model: &ScalarBigram, pairs: &[TokenPair]) -> f64 {
 }
 
 fn split_train_val_pairs(token_ids: &[usize]) -> Result<PairSplits, ScalarError> {
-    let (train_tokens, val_tokens) = data::split_train_val(token_ids, VAL_FRACTION);
-    let train_pairs = match build_pairs(&train_tokens) {
-        Ok(pairs) => pairs,
-        Err(_) => build_pairs(token_ids)?,
-    };
-    let val_pairs = match build_pairs(&val_tokens) {
-        Ok(pairs) => pairs,
-        Err(_) => train_pairs.clone(),
-    };
-    Ok((train_pairs, val_pairs))
+    training::split_train_val_pairs(token_ids).map_err(|_| ScalarError::EmptyDataset)
 }
 
 fn build_pairs(token_ids: &[usize]) -> Result<Vec<TokenPair>, ScalarError> {
-    if token_ids.len() < 2 {
-        return Err(ScalarError::EmptyDataset);
-    }
-    Ok(token_ids
-        .windows(2)
-        .map(|window| (window[0], window[1]))
-        .collect())
+    training::build_pairs(token_ids).map_err(|_| ScalarError::EmptyDataset)
 }
 
 #[cfg(test)]

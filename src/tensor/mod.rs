@@ -9,8 +9,9 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::checkpoint::{CheckpointEvalError, persist_then_eval};
-use crate::config::{SampleConfig, Style, TrainConfig};
+use crate::config::{ModelKind, Optimizer, SampleConfig, Style, TrainConfig};
 use crate::data::{self, TokenizerError};
+use crate::training;
 
 #[cfg(feature = "tch-backend")]
 use tch::nn::{self, OptimizerConfig, VarStore};
@@ -21,20 +22,10 @@ const DEFAULT_LEARNING_RATE: f64 = 0.1;
 const LOSS_WINDOW: usize = 50;
 const RMS_EPS: f64 = 1e-8;
 const LOG_EPS: f64 = 1e-12;
-const VAL_FRACTION: f32 = 0.1;
-const EVAL_EVERY: usize = 20;
-const EVAL_PAIRS: usize = 1024;
-const WARMUP_RATIO: f64 = 0.0;
-const WARMDOWN_RATIO: f64 = 0.5;
-const FINAL_LR_FRAC: f64 = 0.0;
-const FUTURISTIC_CORPUS: &str = "\
-neon skylines hum over orbital transit lanes.\n\
-quantum couriers sync with neural uplinks at dawn.\n\
-autonomous swarms calibrate reactor lattices in silence.\n\
-synthetic pilots chart wormhole routes beyond saturn.\n";
+const EVAL_EVERY: usize = training::EVAL_EVERY;
 
-type TokenPair = (usize, usize);
-type PairSplits = (Vec<TokenPair>, Vec<TokenPair>);
+type TokenPair = training::TokenPair;
+type PairSplits = training::PairSplits;
 
 #[derive(Clone, Copy)]
 struct TensorTrainRuntime<'a> {
@@ -95,6 +86,8 @@ pub enum TensorError {
     Tokenizer(TokenizerError),
     EmptyDataset,
     InvalidTemperature(f64),
+    UnsupportedModelKind(ModelKind),
+    UnsupportedOptimizer(Optimizer),
     #[cfg(feature = "tch-backend")]
     Tch(tch::TchError),
 }
@@ -107,6 +100,12 @@ impl fmt::Display for TensorError {
             Self::EmptyDataset => write!(f, "dataset must contain at least one token pair"),
             Self::InvalidTemperature(value) => {
                 write!(f, "temperature must be finite and > 0, got {value}")
+            }
+            Self::UnsupportedModelKind(model_kind) => {
+                write!(f, "model kind {model_kind} is not supported by tensor mode")
+            }
+            Self::UnsupportedOptimizer(optimizer) => {
+                write!(f, "optimizer {optimizer} is not supported by tensor mode")
             }
             #[cfg(feature = "tch-backend")]
             Self::Tch(err) => write!(f, "{err}"),
@@ -251,12 +250,17 @@ impl TensorBigram {
 }
 
 pub fn train(config: &TrainConfig) -> Result<TrainMetrics, TensorError> {
-    let base_text = data::load_text(&config.data_path)?;
+    let runtime = &config.runtime;
+    ensure_tensor_support(runtime.model_kind)?;
+    ensure_tensor_optimizer_support(config.optimizer)?;
+    let base_text = data::load_text(&runtime.data_path)?;
     train_from_text_with_checkpoints(
         &base_text,
         config.steps,
-        config.seed,
-        config.style,
+        runtime.seed,
+        runtime.model_kind,
+        config.optimizer,
+        runtime.style,
         config.tie_lm_head,
         config.input_rmsnorm,
         TensorTrainRuntime {
@@ -267,14 +271,16 @@ pub fn train(config: &TrainConfig) -> Result<TrainMetrics, TensorError> {
 }
 
 pub fn sample(config: &SampleConfig) -> Result<String, TensorError> {
-    let base_text = data::load_text(&config.data_path)?;
+    let runtime = &config.runtime;
+    ensure_tensor_support(runtime.model_kind)?;
+    let base_text = data::load_text(&runtime.data_path)?;
     sample_from_text(
         &base_text,
         &config.prompt,
         config.max_new_tokens,
         config.temperature,
-        config.seed,
-        config.style,
+        runtime.seed,
+        runtime.style,
     )
 }
 
@@ -283,20 +289,26 @@ fn train_from_text(
     text: &str,
     steps: usize,
     seed: u64,
+    model_kind: ModelKind,
+    optimizer: Optimizer,
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
 ) -> Result<TrainMetrics, TensorError> {
+    ensure_tensor_support(model_kind)?;
+    ensure_tensor_optimizer_support(optimizer)?;
     train_from_text_with_checkpoints(
         text,
         steps,
         seed,
+        model_kind,
+        optimizer,
         style,
         tie_lm_head,
         input_rmsnorm,
         TensorTrainRuntime {
             checkpoint_every: 0,
-            checkpoint_dir: Path::new("results/checkpoints"),
+            checkpoint_dir: Path::new(training::DEFAULT_CHECKPOINT_DIR),
         },
     )
 }
@@ -305,6 +317,8 @@ fn train_from_text_with_checkpoints(
     text: &str,
     steps: usize,
     seed: u64,
+    model_kind: ModelKind,
+    optimizer: Optimizer,
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
@@ -316,6 +330,8 @@ fn train_from_text_with_checkpoints(
             text,
             steps,
             seed,
+            model_kind,
+            optimizer,
             style,
             tie_lm_head,
             input_rmsnorm,
@@ -328,6 +344,8 @@ fn train_from_text_with_checkpoints(
             text,
             steps,
             seed,
+            model_kind,
+            optimizer,
             style,
             tie_lm_head,
             input_rmsnorm,
@@ -340,11 +358,17 @@ fn train_from_text_cpu(
     text: &str,
     steps: usize,
     seed: u64,
+    model_kind: ModelKind,
+    optimizer: Optimizer,
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
     runtime: TensorTrainRuntime<'_>,
 ) -> Result<TrainMetrics, TensorError> {
+    if !matches!(model_kind, ModelKind::Bigram) {
+        return Err(TensorError::UnsupportedModelKind(model_kind));
+    }
+    ensure_tensor_optimizer_support(optimizer)?;
     let corpus = styled_corpus(text, style);
     let tokenizer = data::Tokenizer::from_text(&corpus);
     let token_ids = tokenizer.encode_with_bos(&corpus)?;
@@ -430,11 +454,17 @@ fn train_from_text_tch(
     text: &str,
     steps: usize,
     seed: u64,
+    model_kind: ModelKind,
+    optimizer: Optimizer,
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
     runtime: TensorTrainRuntime<'_>,
 ) -> Result<TrainMetrics, TensorError> {
+    if !matches!(model_kind, ModelKind::Bigram) {
+        return Err(TensorError::UnsupportedModelKind(model_kind));
+    }
+    ensure_tensor_optimizer_support(optimizer)?;
     let corpus = styled_corpus(text, style);
     let tokenizer = data::Tokenizer::from_text(&corpus);
     let token_ids = tokenizer.encode_with_bos(&corpus)?;
@@ -468,7 +498,10 @@ fn train_from_text_tch(
     };
 
     let parameter_count: usize = vs.trainable_variables().iter().map(Tensor::numel).sum();
-    let mut optimizer = nn::AdamW::default().build(&vs, DEFAULT_LEARNING_RATE)?;
+    let mut optimizer = match optimizer {
+        Optimizer::AdamW => nn::AdamW::default().build(&vs, DEFAULT_LEARNING_RATE)?,
+        Optimizer::Sgd => nn::Sgd::default().build(&vs, DEFAULT_LEARNING_RATE)?,
+    };
     let mut rng = StdRng::seed_from_u64(seed ^ 0xD1B5_4A32_44C1_AA77);
     let mut losses = Vec::with_capacity(steps.max(1));
     let mut val_loss = Some(mean_nll_loss_tch(
@@ -788,11 +821,7 @@ fn apply_projection_gradient(
 }
 
 fn build_transition_counts(vocab_size: usize, pairs: &[(usize, usize)]) -> Vec<Vec<u64>> {
-    let mut counts = vec![vec![1_u64; vocab_size]; vocab_size];
-    for (context_id, target_id) in pairs {
-        counts[*context_id][*target_id] += 1;
-    }
-    counts
+    training::build_transition_counts(vocab_size, pairs)
 }
 
 fn sample_index(
@@ -802,45 +831,11 @@ fn sample_index(
     temperature: f64,
     rng: &mut StdRng,
 ) -> usize {
-    let exponent = 1.0 / temperature;
-    let mut weights = Vec::with_capacity(transition_counts[context_id].len());
-    for (token_id, count) in transition_counts[context_id].iter().enumerate() {
-        if token_id == bos_id {
-            weights.push(0.0);
-            continue;
-        }
-        let count = (*count).max(1) as f64;
-        weights.push(count.powf(exponent));
-    }
-    weighted_choice(&weights, rng)
-}
-
-fn weighted_choice(weights: &[f64], rng: &mut StdRng) -> usize {
-    let total: f64 = weights.iter().sum();
-    if total <= 0.0 {
-        return 0;
-    }
-
-    let mut sample = rng.gen_range(0.0..total);
-    let mut last_nonzero = 0;
-    for (idx, weight) in weights.iter().enumerate() {
-        if *weight <= 0.0 {
-            continue;
-        }
-        last_nonzero = idx;
-        if sample <= *weight {
-            return idx;
-        }
-        sample -= *weight;
-    }
-    last_nonzero
+    training::sample_index(transition_counts, context_id, bos_id, temperature, rng)
 }
 
 fn styled_corpus(base: &str, style: Style) -> String {
-    match style {
-        Style::Classic => base.to_string(),
-        Style::Futuristic => format!("{base}\n{FUTURISTIC_CORPUS}"),
-    }
+    training::styled_corpus(base, style)
 }
 
 fn apply_futuristic_boost(
@@ -848,35 +843,11 @@ fn apply_futuristic_boost(
     tokenizer: &data::Tokenizer,
     bos_id: usize,
 ) {
-    const BOOST: u64 = 400;
-    const PHRASES: [&str; 8] = [
-        "neon",
-        "quantum",
-        "neural",
-        "orbital",
-        "reactor",
-        "wormhole",
-        "autonomous",
-        "synthetic",
-    ];
-
-    for phrase in PHRASES {
-        let Ok(ids) = tokenizer.encode(phrase) else {
-            continue;
-        };
-        if ids.is_empty() {
-            continue;
-        }
-        transition_counts[bos_id][ids[0]] += BOOST;
-        for pair in ids.windows(2) {
-            transition_counts[pair[0]][pair[1]] += BOOST;
-        }
-    }
+    training::apply_futuristic_boost(transition_counts, tokenizer, bos_id)
 }
 
 fn eval_pairs_slice(pairs: &[(usize, usize)]) -> &[(usize, usize)] {
-    let eval_len = pairs.len().min(EVAL_PAIRS);
-    &pairs[..eval_len]
+    training::eval_pairs_slice(pairs)
 }
 
 fn mean_nll_loss_cpu(model: &TensorBigram, pairs: &[(usize, usize)]) -> f64 {
@@ -888,39 +859,30 @@ fn mean_nll_loss_cpu(model: &TensorBigram, pairs: &[(usize, usize)]) -> f64 {
 }
 
 fn split_train_val_pairs(token_ids: &[usize]) -> Result<PairSplits, TensorError> {
-    let (train_tokens, val_tokens) = data::split_train_val(token_ids, VAL_FRACTION);
-    let train_pairs = match build_pairs(&train_tokens) {
-        Ok(pairs) => pairs,
-        Err(_) => build_pairs(token_ids)?,
-    };
-    let val_pairs = match build_pairs(&val_tokens) {
-        Ok(pairs) => pairs,
-        Err(_) => train_pairs.clone(),
-    };
-    Ok((train_pairs, val_pairs))
+    training::split_train_val_pairs(token_ids).map_err(|_| TensorError::EmptyDataset)
+}
+
+fn ensure_tensor_support(model_kind: ModelKind) -> Result<(), TensorError> {
+    if matches!(model_kind, ModelKind::Bigram) {
+        Ok(())
+    } else {
+        Err(TensorError::UnsupportedModelKind(model_kind))
+    }
+}
+
+fn ensure_tensor_optimizer_support(optimizer: Optimizer) -> Result<(), TensorError> {
+    if cfg!(not(feature = "tch-backend")) && matches!(optimizer, Optimizer::AdamW) {
+        return Err(TensorError::UnsupportedOptimizer(optimizer));
+    }
+    Ok(())
 }
 
 fn should_eval(step: usize, total_steps: usize, eval_every: usize) -> bool {
-    if step == total_steps {
-        return true;
-    }
-    eval_every > 0 && step.is_multiple_of(eval_every)
+    training::should_eval(step, total_steps, eval_every)
 }
 
 fn lr_multiplier(step: usize, total_steps: usize) -> f64 {
-    if total_steps == 0 {
-        return 1.0;
-    }
-    let warmup_iters = (WARMUP_RATIO * (total_steps as f64)).round() as usize;
-    let warmdown_iters = (WARMDOWN_RATIO * (total_steps as f64)).round() as usize;
-    if warmup_iters > 0 && step < warmup_iters {
-        return (step + 1) as f64 / (warmup_iters as f64);
-    }
-    if warmdown_iters == 0 || step <= total_steps.saturating_sub(warmdown_iters) {
-        return 1.0;
-    }
-    let progress = (total_steps - step) as f64 / (warmdown_iters as f64);
-    progress + (1.0 - progress) * FINAL_LR_FRAC
+    training::lr_multiplier(step, total_steps)
 }
 
 fn checkpoint_path(checkpoint_dir: &Path, backend: &str, step: usize) -> PathBuf {
@@ -974,37 +936,137 @@ fn maybe_persist_checkpoint(
 }
 
 fn build_pairs(token_ids: &[usize]) -> Result<Vec<TokenPair>, TensorError> {
-    if token_ids.len() < 2 {
-        return Err(TensorError::EmptyDataset);
-    }
-    Ok(token_ids
-        .windows(2)
-        .map(|window| (window[0], window[1]))
-        .collect())
+    training::build_pairs(token_ids).map_err(|_| TensorError::EmptyDataset)
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::env;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
-    use crate::config::Style;
+    use crate::{cli, training};
+    use crate::config::{AppCommand, Mode, ModelKind, Optimizer, RuntimeConfig, SampleConfig, Style, TrainConfig};
 
     use super::{
         TensorBigram, TensorError, eval_pairs_slice, lr_multiplier, mean_nll_loss_cpu,
         sample_from_text, should_eval, split_train_val_pairs, train_from_text,
     };
 
+    struct TempTextFile {
+        path: PathBuf,
+    }
+
+    impl TempTextFile {
+        fn as_path(&self) -> &Path {
+            &self.path
+        }
+
+        fn as_path_string(&self) -> String {
+            self.as_path().to_string_lossy().to_string()
+        }
+    }
+
+    impl Drop for TempTextFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    fn temp_text_file() -> TempTextFile {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("nanochat_tensor_cli_{unique}.txt"));
+        fs::write(&path, "abababababab").expect("temp text fixture");
+        TempTextFile { path }
+    }
+
+    fn train_config_from_cli(mut args: Vec<String>) -> TrainConfig {
+        let mut iter = vec!["nanochat-rs-next".to_string(), "train".to_string()];
+        iter.append(&mut args);
+        let command = cli::try_command_from_iter(iter).expect("valid train command");
+        let AppCommand::Train(config) = command else {
+            panic!("expected train command");
+        };
+        config
+    }
+
+    fn sample_config_from_cli(mut args: Vec<String>) -> SampleConfig {
+        let mut iter = vec!["nanochat-rs-next".to_string(), "sample".to_string()];
+        iter.append(&mut args);
+        let command = cli::try_command_from_iter(iter).expect("valid sample command");
+        let AppCommand::Sample(config) = command else {
+            panic!("expected sample command");
+        };
+        config
+    }
+
+    fn train_config(
+        model_kind: ModelKind,
+        optimizer: Optimizer,
+    ) -> TrainConfig {
+        TrainConfig {
+            runtime: RuntimeConfig {
+                mode: Mode::Tensor,
+                model_kind,
+                style: Style::Classic,
+                data_path: PathBuf::from("input.txt"),
+                seed: 1,
+            },
+            optimizer,
+            tie_lm_head: true,
+            input_rmsnorm: false,
+            steps: 1,
+            checkpoint_every: 0,
+            checkpoint_dir: PathBuf::from(training::DEFAULT_CHECKPOINT_DIR),
+        }
+    }
+
+    fn sample_config(model_kind: ModelKind) -> SampleConfig {
+        SampleConfig {
+            runtime: RuntimeConfig {
+                mode: Mode::Tensor,
+                model_kind,
+                style: Style::Classic,
+                data_path: PathBuf::from("input.txt"),
+                seed: 7,
+            },
+            temperature: 1.0,
+            max_new_tokens: 8,
+            prompt: String::from("a"),
+        }
+    }
+
     #[test]
     fn train_loss_drops_on_repetitive_text() {
-        let baseline = train_from_text("abababababababab", 0, 13, Style::Classic, true, false)
+        let baseline = train_from_text(
+            "abababababababab",
+            0,
+            13,
+            ModelKind::Bigram,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            false,
+        )
             .expect("baseline metrics");
-        let trained = train_from_text("abababababababab", 400, 13, Style::Classic, true, false)
+        let trained = train_from_text(
+            "abababababababab",
+            400,
+            13,
+            ModelKind::Bigram,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            false,
+        )
             .expect("trained metrics");
         assert!(trained.mean_loss_last_n < baseline.final_loss);
         assert!(trained.final_loss.is_finite());
@@ -1018,6 +1080,169 @@ mod tests {
         assert_eq!(output.len(), 14);
     }
 
+    #[derive(Clone, Copy)]
+    enum RejectionExpectation {
+        ModelKind(ModelKind),
+        Optimizer(Optimizer),
+    }
+
+    impl RejectionExpectation {
+        fn assert_error(self, err: TensorError) {
+            match (self, err) {
+                (Self::ModelKind(expected), TensorError::UnsupportedModelKind(actual)) => {
+                    assert_eq!(actual, expected);
+                }
+                (Self::Optimizer(expected), TensorError::UnsupportedOptimizer(actual)) => {
+                    assert_eq!(actual, expected);
+                }
+                (_, err) => panic!("unexpected error type: {err:?}"),
+            }
+        }
+    }
+
+    fn tensor_cli_base_args(path: &str) -> Vec<String> {
+        vec![
+            "--mode".to_string(),
+            "tensor".to_string(),
+            "--data".to_string(),
+            path.to_string(),
+        ]
+    }
+
+    #[derive(Clone, Copy)]
+    enum PublicRejectionCase {
+        Train {
+            label: &'static str,
+            model_kind: ModelKind,
+            optimizer: Optimizer,
+            expected: RejectionExpectation,
+        },
+        Sample {
+            label: &'static str,
+            model_kind: ModelKind,
+            expected: RejectionExpectation,
+        },
+    }
+
+    #[derive(Clone, Copy)]
+    enum CliRejectionCase {
+        Train {
+            label: &'static str,
+            model_kind: ModelKind,
+            optimizer: Optimizer,
+            expected: RejectionExpectation,
+        },
+        Sample {
+            label: &'static str,
+            model_kind: ModelKind,
+            expected: RejectionExpectation,
+        },
+    }
+
+    #[test]
+    fn tensor_public_rejections_are_reported_consistently() {
+        let cases = [
+            PublicRejectionCase::Train {
+                label: "train should reject mini-gpt in tensor mode",
+                model_kind: ModelKind::MiniGpt,
+                optimizer: Optimizer::Sgd,
+                expected: RejectionExpectation::ModelKind(ModelKind::MiniGpt),
+            },
+            PublicRejectionCase::Sample {
+                label: "sample should reject mini-gpt in tensor mode",
+                model_kind: ModelKind::MiniGpt,
+                expected: RejectionExpectation::ModelKind(ModelKind::MiniGpt),
+            },
+            #[cfg(not(feature = "tch-backend"))]
+            PublicRejectionCase::Train {
+                label: "train should reject adamw without tch backend",
+                model_kind: ModelKind::Bigram,
+                optimizer: Optimizer::AdamW,
+                expected: RejectionExpectation::Optimizer(Optimizer::AdamW),
+            },
+        ];
+
+        for case in cases {
+            match case {
+                PublicRejectionCase::Train {
+                    label,
+                    model_kind,
+                    optimizer,
+                    expected,
+                } => expected.assert_error(
+                    super::train(&train_config(model_kind, optimizer)).expect_err(label),
+                ),
+                PublicRejectionCase::Sample {
+                    label,
+                    model_kind,
+                    expected,
+                } => expected.assert_error(
+                    super::sample(&sample_config(model_kind)).expect_err(label),
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn tensor_cli_rejections_are_reported_consistently() {
+        let path = temp_text_file();
+        let path_string = path.as_path_string();
+
+        let cases = [
+            CliRejectionCase::Train {
+                label: "train cli should reject mini-gpt in tensor mode",
+                model_kind: ModelKind::MiniGpt,
+                optimizer: Optimizer::Sgd,
+                expected: RejectionExpectation::ModelKind(ModelKind::MiniGpt),
+            },
+            CliRejectionCase::Sample {
+                label: "sample cli should reject mini-gpt in tensor mode",
+                model_kind: ModelKind::MiniGpt,
+                expected: RejectionExpectation::ModelKind(ModelKind::MiniGpt),
+            },
+            #[cfg(not(feature = "tch-backend"))]
+            CliRejectionCase::Train {
+                label: "train cli should reject adamw without tch backend",
+                model_kind: ModelKind::Bigram,
+                optimizer: Optimizer::AdamW,
+                expected: RejectionExpectation::Optimizer(Optimizer::AdamW),
+            },
+        ];
+
+        for case in cases {
+            match case {
+                CliRejectionCase::Train {
+                    label,
+                    model_kind,
+                    optimizer,
+                    expected,
+                } => {
+                    let mut args = tensor_cli_base_args(&path_string);
+                    args.extend([
+                        "--model-kind".to_string(),
+                        model_kind.to_string(),
+                        "--optimizer".to_string(),
+                        optimizer.to_string(),
+                    ]);
+                    expected.assert_error(
+                        super::train(&train_config_from_cli(args)).expect_err(label),
+                    );
+                }
+                CliRejectionCase::Sample {
+                    label,
+                    model_kind,
+                    expected,
+                } => {
+                    let mut args = tensor_cli_base_args(&path_string);
+                    args.extend(["--model-kind".to_string(), model_kind.to_string()]);
+                    expected.assert_error(
+                        super::sample(&sample_config_from_cli(args)).expect_err(label),
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn sample_rejects_invalid_temperature() {
         let err = sample_from_text("abab", "", 5, 0.0, 1, Style::Classic)
@@ -1029,13 +1254,56 @@ mod tests {
     }
 
     #[test]
+    fn sample_rejects_non_finite_temperature() {
+        let invalid_temperatures = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        for temperature in invalid_temperatures {
+            let err = sample_from_text("abab", "", 5, temperature, 1, Style::Classic)
+                .expect_err("invalid temperature should fail");
+            match err {
+                TensorError::InvalidTemperature(value) => {
+                    assert!(value.is_infinite() || value.is_nan())
+                }
+                _ => panic!("unexpected error type"),
+            }
+        }
+    }
+
+    #[test]
     fn empty_input_errors() {
-        let err =
-            train_from_text("", 1, 0, Style::Classic, true, false).expect_err("empty dataset");
+        let err = train_from_text(
+            "",
+            1,
+            0,
+            ModelKind::Bigram,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            false,
+        )
+        .expect_err("empty dataset");
         match err {
             TensorError::EmptyDataset => {}
             _ => panic!("unexpected error type"),
         }
+    }
+
+    #[test]
+    fn train_handles_minimal_dataset_split_fallback() {
+        let metrics = train_from_text(
+            "a",
+            1,
+            1,
+            ModelKind::Bigram,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            false,
+        )
+        .expect("metrics should be produced for minimal text");
+        assert_eq!(metrics.train_tokens, 1);
+        let val_loss = metrics.val_loss.expect("validation loss should be computed");
+        assert!(val_loss.is_finite());
+        assert!(metrics.final_loss.is_finite());
     }
 
     #[test]
@@ -1050,16 +1318,43 @@ mod tests {
 
     #[test]
     fn untied_metrics_report_more_parameters() {
-        let tied = train_from_text("abababababababab", 0, 5, Style::Classic, true, false)
+        let tied = train_from_text(
+            "abababababababab",
+            0,
+            5,
+            ModelKind::Bigram,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            false,
+        )
             .expect("tied metrics");
-        let untied = train_from_text("abababababababab", 0, 5, Style::Classic, false, false)
+        let untied = train_from_text(
+            "abababababababab",
+            0,
+            5,
+            ModelKind::Bigram,
+            Optimizer::Sgd,
+            Style::Classic,
+            false,
+            false,
+        )
             .expect("untied metrics");
         assert!(untied.parameter_count > tied.parameter_count);
     }
 
     #[test]
     fn train_reports_backend_and_device() {
-        let metrics = train_from_text("abababababababab", 1, 5, Style::Classic, true, false)
+        let metrics = train_from_text(
+            "abababababababab",
+            1,
+            5,
+            ModelKind::Bigram,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            false,
+        )
             .expect("metrics");
         assert!(!metrics.backend.is_empty());
         assert!(!metrics.device.is_empty());
@@ -1080,12 +1375,30 @@ mod tests {
 
     #[test]
     fn train_reports_finite_throughput_metrics() {
-        let zero_step = train_from_text("abababababababab", 0, 11, Style::Classic, true, false)
+        let zero_step = train_from_text(
+            "abababababababab",
+            0,
+            11,
+            ModelKind::Bigram,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            false,
+        )
             .expect("zero-step metrics");
         assert_eq!(zero_step.steps_per_sec, 0.0);
         assert_eq!(zero_step.tokens_per_sec, 0.0);
 
-        let trained = train_from_text("abababababababab", 8, 11, Style::Classic, true, false)
+        let trained = train_from_text(
+            "abababababababab",
+            8,
+            11,
+            ModelKind::Bigram,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            false,
+        )
             .expect("trained metrics");
         assert!(trained.steps_per_sec.is_finite());
         assert!(trained.tokens_per_sec.is_finite());
@@ -1096,7 +1409,17 @@ mod tests {
     #[test]
     fn train_uses_split_and_reports_validation_loss() {
         let text = "abcdefghijklmnopqrstuvwxyz";
-        let metrics = train_from_text(text, 5, 29, Style::Classic, true, false).expect("metrics");
+        let metrics = train_from_text(
+            text,
+            5,
+            29,
+            ModelKind::Bigram,
+            Optimizer::Sgd,
+            Style::Classic,
+            true,
+            false,
+        )
+        .expect("metrics");
 
         let tokenizer = crate::data::Tokenizer::from_text(text);
         let token_ids = tokenizer
@@ -1142,6 +1465,8 @@ mod tests {
             "abababababababab",
             5,
             41,
+            ModelKind::Bigram,
+            Optimizer::Sgd,
             Style::Classic,
             true,
             false,
@@ -1173,6 +1498,12 @@ mod tests {
 
     #[test]
     fn python_parity_matches_rust_tensor_loss_trace() {
+        let has_python = Command::new("python3").arg("--version").output().is_ok();
+        if !has_python {
+            eprintln!("skipping python parity test: python3 not available");
+            return;
+        }
+
         let text = "abracadabra abracadabra";
         let tokenizer = crate::data::Tokenizer::from_text(text);
         let token_ids = tokenizer

@@ -6,11 +6,12 @@ use rand::{Rng, SeedableRng};
 use crate::config::{ModelKind, Optimizer, Style};
 use crate::data::{self, Tokenizer, TokenizerError};
 use crate::eval::validate_prompt_length;
+use crate::training;
 
 use super::optimizer::{AdamW, AdamWConfig};
 use super::value::Value;
 use super::{
-    ScalarError, TrainMetrics, VAL_FRACTION, build_pairs, lr_multiplier, should_eval, styled_corpus,
+    ScalarError, TrainMetrics, build_pairs, lr_multiplier, should_eval, styled_corpus,
 };
 
 const MINI_GPT_EMBD: usize = 16;
@@ -25,7 +26,6 @@ const MINI_GPT_RMS_EPS: f64 = 1e-5;
 const MINI_GPT_LEARNING_RATE: f64 = 0.02;
 const MINI_GPT_ADAMW_LEARNING_RATE: f64 = 0.01;
 const MINI_GPT_LOSS_WINDOW: usize = 50;
-const MINI_GPT_EVAL_EVERY: usize = 20;
 const MINI_GPT_EVAL_WINDOWS: usize = 32;
 
 pub(super) fn train_from_text(
@@ -73,7 +73,7 @@ pub(super) fn train_from_text(
             };
             losses.push(loss);
             let step_idx = step + 1;
-            if should_eval(step_idx, steps, MINI_GPT_EVAL_EVERY) {
+            if should_eval(step_idx, steps, training::EVAL_EVERY) {
                 val_loss = Some(mean_window_loss(&mut model, &val_token_ids));
             }
         }
@@ -400,19 +400,7 @@ fn mean_window_loss(model: &mut ScalarMiniGpt, token_ids: &[usize]) -> f64 {
 }
 
 fn split_train_val_tokens(token_ids: &[usize]) -> Result<(Vec<usize>, Vec<usize>), ScalarError> {
-    let _ = build_pairs(token_ids)?;
-    let (train_tokens, val_tokens) = data::split_train_val(token_ids, VAL_FRACTION);
-    let train_tokens = if build_pairs(&train_tokens).is_ok() {
-        train_tokens
-    } else {
-        token_ids.to_vec()
-    };
-    let val_tokens = if build_pairs(&val_tokens).is_ok() {
-        val_tokens
-    } else {
-        train_tokens.clone()
-    };
-    Ok((train_tokens, val_tokens))
+    training::split_train_val_tokens(token_ids).map_err(|_| ScalarError::EmptyDataset)
 }
 
 fn sample_from_logits(
@@ -432,7 +420,7 @@ fn sample_from_logits(
             weights.push(prob.data().max(0.0));
         }
     }
-    weighted_choice(&weights, rng)
+    training::weighted_choice(&weights, rng)
 }
 
 fn init_matrix(rows: usize, cols: usize, std: f64, rng: &mut StdRng) -> Vec<Vec<Value>> {
@@ -503,27 +491,6 @@ fn sum_values(values: &[Value]) -> Value {
         .expect("sum_values requires at least one value")
         .clone();
     iter.fold(first, |acc, value| acc.add(value))
-}
-
-fn weighted_choice(weights: &[f64], rng: &mut StdRng) -> usize {
-    let total: f64 = weights.iter().sum();
-    if total <= 0.0 {
-        return 0;
-    }
-
-    let mut sample = rng.gen_range(0.0..total);
-    let mut last_nonzero = 0;
-    for (idx, weight) in weights.iter().enumerate() {
-        if *weight <= 0.0 {
-            continue;
-        }
-        last_nonzero = idx;
-        if sample <= *weight {
-            return idx;
-        }
-        sample -= *weight;
-    }
-    last_nonzero
 }
 
 #[cfg(test)]
