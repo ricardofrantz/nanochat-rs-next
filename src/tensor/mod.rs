@@ -973,11 +973,18 @@ fn build_pairs(token_ids: &[usize]) -> Result<Vec<TokenPair>, TensorError> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
 
     use crate::config::Style;
 
-    use super::{TensorError, lr_multiplier, sample_from_text, should_eval, train_from_text};
+    use super::{
+        TensorBigram, TensorError, eval_pairs_slice, lr_multiplier, mean_nll_loss_cpu,
+        sample_from_text, should_eval, split_train_val_pairs, train_from_text,
+    };
 
     #[test]
     fn train_loss_drops_on_repetitive_text() {
@@ -1133,5 +1140,170 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&checkpoint_dir);
+    }
+
+    #[test]
+    fn python_parity_matches_rust_tensor_loss_trace() {
+        let text = "abracadabra abracadabra";
+        let tokenizer = crate::data::Tokenizer::from_text(text);
+        let token_ids = tokenizer
+            .encode_with_bos(text)
+            .expect("token ids should encode");
+        let (train_pairs, val_pairs) = split_train_val_pairs(&token_ids).expect("pair splits");
+        let eval_val_pairs = eval_pairs_slice(&val_pairs).to_vec();
+
+        let vocab_size = tokenizer.vocab_size();
+        let initial_embedding: Vec<Vec<f64>> = (0..vocab_size)
+            .map(|i| {
+                (0..vocab_size)
+                    .map(|j| ((i * 31 + j * 17) as f64) / 1000.0 - 0.1)
+                    .collect()
+            })
+            .collect();
+
+        let steps = 24usize;
+        let mut rng = StdRng::seed_from_u64(17 ^ 0xD1B5_4A32_44C1_AA77);
+        let pair_indices: Vec<usize> = (0..steps)
+            .map(|_| rng.gen_range(0..train_pairs.len()))
+            .collect();
+
+        let mut rust_model = TensorBigram {
+            tie_lm_head: true,
+            input_rmsnorm: false,
+            token_embedding: initial_embedding.clone(),
+            lm_head: None,
+        };
+        let mut rust_losses = Vec::with_capacity(steps);
+        for (step, pair_idx) in pair_indices.iter().copied().enumerate() {
+            let (context_id, target_id) = train_pairs[pair_idx];
+            let lr = super::DEFAULT_LEARNING_RATE * lr_multiplier(step, steps);
+            let loss = rust_model.train_step(context_id, target_id, lr);
+            rust_losses.push(loss);
+        }
+        let rust_val_loss = mean_nll_loss_cpu(&rust_model, &eval_val_pairs);
+
+        let script = format!(
+            r#"
+import math
+train_pairs = {train_pairs:?}
+val_pairs = {eval_val_pairs:?}
+pair_indices = {pair_indices:?}
+token_embedding = {initial_embedding:?}
+steps = {steps}
+default_lr = {default_lr}
+log_eps = {log_eps}
+
+def dot(lhs, rhs):
+    return sum(a * b for a, b in zip(lhs, rhs))
+
+def softmax_probs_and_loss(logits, target_id):
+    max_logit = max(logits)
+    shifted = [logit - max_logit for logit in logits]
+    exp_logits = [math.exp(logit) for logit in shifted]
+    exp_sum = sum(exp_logits)
+    probs = [value / exp_sum for value in exp_logits]
+    loss = -math.log(probs[target_id] + log_eps)
+    return probs, loss
+
+def nll_loss(context_id, target_id):
+    hidden = token_embedding[context_id][:]
+    logits = [dot(hidden, row) for row in token_embedding]
+    _, loss = softmax_probs_and_loss(logits, target_id)
+    return loss
+
+losses = []
+for step, pair_idx in enumerate(pair_indices):
+    context_id, target_id = train_pairs[pair_idx]
+    hidden = token_embedding[context_id][:]
+    logits = [dot(hidden, row) for row in token_embedding]
+    probs, loss = softmax_probs_and_loss(logits, target_id)
+
+    logits_grad = probs[:]
+    logits_grad[target_id] -= 1.0
+
+    vocab_size = len(token_embedding)
+    hidden_grad = [0.0] * vocab_size
+    for row_idx, row in enumerate(token_embedding):
+        grad = logits_grad[row_idx]
+        if grad == 0.0:
+            continue
+        for col_idx, weight in enumerate(row):
+            hidden_grad[col_idx] += grad * weight
+
+    warmdown_iters = round(0.5 * steps)
+    if warmdown_iters == 0 or step <= steps - warmdown_iters:
+        lr_mult = 1.0
+    else:
+        progress = (steps - step) / warmdown_iters
+        lr_mult = progress
+    lr = default_lr * lr_mult
+
+    for row_idx, grad in enumerate(logits_grad):
+        if grad == 0.0:
+            continue
+        for col_idx, hidden_value in enumerate(hidden):
+            token_embedding[row_idx][col_idx] -= lr * grad * hidden_value
+
+    for col_idx, grad in enumerate(hidden_grad):
+        token_embedding[context_id][col_idx] -= lr * grad
+
+    losses.append(loss)
+
+val_loss = sum(nll_loss(context_id, target_id) for context_id, target_id in val_pairs) / len(val_pairs)
+print('losses=' + ','.join(f'{{loss:.17g}}' for loss in losses))
+print(f'val={{val_loss:.17g}}')
+"#,
+            train_pairs = train_pairs,
+            eval_val_pairs = eval_val_pairs,
+            pair_indices = pair_indices,
+            initial_embedding = initial_embedding,
+            steps = steps,
+            default_lr = super::DEFAULT_LEARNING_RATE,
+            log_eps = super::LOG_EPS,
+        );
+
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("python3 process should run");
+        assert!(
+            output.status.success(),
+            "python script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("python output should be utf-8");
+        let mut python_losses = None::<Vec<f64>>;
+        let mut python_val = None::<f64>;
+        for line in stdout.lines() {
+            if let Some(raw_losses) = line.strip_prefix("losses=") {
+                let parsed = raw_losses
+                    .split(',')
+                    .map(|token| token.parse::<f64>().expect("loss token should parse"))
+                    .collect::<Vec<_>>();
+                python_losses = Some(parsed);
+            }
+            if let Some(raw_val) = line.strip_prefix("val=") {
+                python_val = Some(raw_val.parse::<f64>().expect("val token should parse"));
+            }
+        }
+        let python_losses = python_losses.expect("python losses should be reported");
+        let python_val = python_val.expect("python val should be reported");
+
+        assert_eq!(rust_losses.len(), python_losses.len());
+        for (rust_loss, python_loss) in rust_losses.iter().zip(python_losses.iter()) {
+            let abs_diff = (rust_loss - python_loss).abs();
+            assert!(
+                abs_diff < 1e-10,
+                "loss mismatch: rust={rust_loss} python={python_loss} abs_diff={abs_diff}"
+            );
+        }
+
+        let val_abs_diff = (rust_val_loss - python_val).abs();
+        assert!(
+            val_abs_diff < 1e-10,
+            "val loss mismatch: rust={rust_val_loss} python={python_val} abs_diff={val_abs_diff}"
+        );
     }
 }

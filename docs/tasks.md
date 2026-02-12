@@ -18,7 +18,7 @@
 - **Files**: `src/tensor/mod.rs`, `src/data/mod.rs`
 - **Tests**: Parity test comparing Rust vs Python loss on identical small dataset
 - **Done when**: On a 10K-char dataset with matched hyperparameters, Rust and Python produce eval losses within 5% after N steps
-- [ ] Write parity comparison test
+- [x] Write parity comparison test
 - [x] Implement eval schedule (eval every N steps)
 - [x] Use `split_train_val` in training loop (currently unused)
 - [x] Align optimizer and LR with upstream defaults
