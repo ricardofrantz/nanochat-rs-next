@@ -22,6 +22,9 @@ const LOSS_WINDOW: usize = 50;
 pub(super) const VAL_FRACTION: f32 = 0.1;
 const EVAL_EVERY: usize = 20;
 const EVAL_PAIRS: usize = 1024;
+const WARMUP_RATIO: f64 = 0.0;
+const WARMDOWN_RATIO: f64 = 0.5;
+const FINAL_LR_FRAC: f64 = 0.0;
 const FUTURISTIC_CORPUS: &str = "\
 neon skylines hum over orbital transit lanes.\n\
 quantum couriers sync with neural uplinks at dawn.\n\
@@ -170,6 +173,22 @@ pub(super) fn should_eval(step: usize, total_steps: usize, eval_every: usize) ->
     eval_every > 0 && step.is_multiple_of(eval_every)
 }
 
+pub(super) fn lr_multiplier(step: usize, total_steps: usize) -> f64 {
+    if total_steps == 0 {
+        return 1.0;
+    }
+    let warmup_iters = (WARMUP_RATIO * (total_steps as f64)).round() as usize;
+    let warmdown_iters = (WARMDOWN_RATIO * (total_steps as f64)).round() as usize;
+    if warmup_iters > 0 && step < warmup_iters {
+        return (step + 1) as f64 / (warmup_iters as f64);
+    }
+    if warmdown_iters == 0 || step <= total_steps.saturating_sub(warmdown_iters) {
+        return 1.0;
+    }
+    let progress = (total_steps - step) as f64 / (warmdown_iters as f64);
+    progress + (1.0 - progress) * FINAL_LR_FRAC
+}
+
 fn train_from_text(
     text: &str,
     steps: usize,
@@ -200,6 +219,7 @@ fn train_from_text(
         for step in 0..steps {
             let pair_idx = rng.gen_range(0..train_pairs.len());
             let (context_id, target_id) = train_pairs[pair_idx];
+            let lr = lr_multiplier(step, steps);
             let loss = if let Some(opt) = adamw.as_mut() {
                 for parameter in &parameters {
                     parameter.zero_grad();
@@ -207,10 +227,15 @@ fn train_from_text(
                 let loss_node = model.nll_loss(context_id, target_id);
                 let loss = loss_node.data();
                 loss_node.backward();
-                opt.step(&parameters, ADAMW_LEARNING_RATE);
+                opt.step(&parameters, ADAMW_LEARNING_RATE * lr);
                 loss
             } else {
-                model.train_step(context_id, target_id, DEFAULT_LEARNING_RATE, &parameters)
+                model.train_step(
+                    context_id,
+                    target_id,
+                    DEFAULT_LEARNING_RATE * lr,
+                    &parameters,
+                )
             };
             losses.push(loss);
             let step_idx = step + 1;
@@ -387,7 +412,7 @@ fn build_pairs(token_ids: &[usize]) -> Result<Vec<TokenPair>, ScalarError> {
 mod tests {
     use crate::config::{Optimizer, Style};
 
-    use super::{ScalarError, sample_from_text, train_from_text};
+    use super::{ScalarError, lr_multiplier, sample_from_text, train_from_text};
 
     #[test]
     fn train_loss_drops_on_repetitive_text() {
@@ -534,5 +559,15 @@ mod tests {
             adamw.mean_loss_last_n,
             sgd.mean_loss_last_n
         );
+    }
+
+    #[test]
+    fn lr_schedule_matches_upstream_linear_warmdown_shape() {
+        let total_steps = 10;
+        assert!((lr_multiplier(0, total_steps) - 1.0).abs() < 1e-12);
+        assert!((lr_multiplier(5, total_steps) - 1.0).abs() < 1e-12);
+        assert!((lr_multiplier(8, total_steps) - 0.4).abs() < 1e-12);
+        assert!((lr_multiplier(9, total_steps) - 0.2).abs() < 1e-12);
+        assert!((lr_multiplier(10, total_steps) - 0.0).abs() < 1e-12);
     }
 }

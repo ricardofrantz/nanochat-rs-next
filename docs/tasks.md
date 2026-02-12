@@ -107,13 +107,13 @@
 - [x] Implement and verify
 
 ### 4.2: Add learning rate schedule [FR-010]
-- **What**: Implement warmup + cosine decay schedule matching upstream
+- **What**: Implement warmup + linear warmdown schedule matching upstream
 - **Files**: `src/scalar/mod.rs`, `src/tensor/mod.rs`
 - **Tests**: LR at step 0 is warmup value; LR at final step matches min LR
 - **Done when**: LR schedule matches upstream nanochat's schedule
-- [ ] Write LR schedule unit test
-- [ ] Implement schedule function
-- [ ] Wire into both scalar and tensor training loops
+- [x] Write LR schedule unit test
+- [x] Implement schedule function
+- [x] Wire into both scalar and tensor training loops
 
 ---
 

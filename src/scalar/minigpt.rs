@@ -9,7 +9,9 @@ use crate::eval::validate_prompt_length;
 
 use super::optimizer::{AdamW, AdamWConfig};
 use super::value::Value;
-use super::{ScalarError, TrainMetrics, VAL_FRACTION, build_pairs, should_eval, styled_corpus};
+use super::{
+    ScalarError, TrainMetrics, VAL_FRACTION, build_pairs, lr_multiplier, should_eval, styled_corpus,
+};
 
 const MINI_GPT_EMBD: usize = 16;
 const MINI_GPT_HEADS: usize = 4;
@@ -56,6 +58,7 @@ pub(super) fn train_from_text(
     } else {
         for step in 0..steps {
             let window = select_training_window(&train_token_ids, &mut rng);
+            let lr = lr_multiplier(step, steps);
             let loss = if let Some(opt) = adamw.as_mut() {
                 for parameter in &parameters {
                     parameter.zero_grad();
@@ -63,10 +66,10 @@ pub(super) fn train_from_text(
                 let loss_node = model.loss_for_tokens(window);
                 let loss = loss_node.data();
                 loss_node.backward();
-                opt.step(&parameters, MINI_GPT_ADAMW_LEARNING_RATE);
+                opt.step(&parameters, MINI_GPT_ADAMW_LEARNING_RATE * lr);
                 loss
             } else {
-                model.train_step(window, MINI_GPT_LEARNING_RATE, &parameters)
+                model.train_step(window, MINI_GPT_LEARNING_RATE * lr, &parameters)
             };
             losses.push(loss);
             let step_idx = step + 1;
