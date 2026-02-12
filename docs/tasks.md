@@ -22,7 +22,7 @@
 - [x] Implement eval schedule (eval every N steps)
 - [x] Use `split_train_val` in training loop (currently unused)
 - [x] Align optimizer and LR with upstream defaults
-- [ ] Implement
+- [x] Implement
 
 ### 1.3: Add train/val eval reporting to metrics [FR-010]
 - **What**: Report both training loss and validation loss in `TrainMetrics`
