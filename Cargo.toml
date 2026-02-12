@@ -2,7 +2,13 @@
 name = "microgpt-rs-lab"
 version = "0.1.0"
 edition = "2024"
+description = "Rust microGPT lab with scalar autograd and tensor-style character-level train/sample modes plus ablation reporting."
+
+[features]
+default = []
+tch-backend = ["dep:tch"]
 
 [dependencies]
 clap = { version = "4.5.30", features = ["derive"] }
 rand = "0.8.5"
+tch = { version = "0.20.0", optional = true }
