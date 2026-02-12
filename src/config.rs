@@ -35,6 +35,8 @@ impl fmt::Display for Style {
 pub struct TrainConfig {
     pub mode: Mode,
     pub style: Style,
+    pub tie_lm_head: bool,
+    pub input_rmsnorm: bool,
     pub steps: usize,
     pub data_path: PathBuf,
     pub seed: u64,

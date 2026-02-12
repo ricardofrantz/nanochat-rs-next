@@ -55,6 +55,10 @@ struct TrainArgs {
     mode: CliMode,
     #[arg(long, value_enum, default_value_t = CliStyle::Futuristic)]
     style: CliStyle,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    tie_lm_head: bool,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    input_rmsnorm: bool,
     #[arg(long, default_value_t = 500)]
     steps: usize,
     #[arg(long, default_value = "input.txt")]
@@ -111,6 +115,8 @@ fn from_cli(cli: Cli) -> AppCommand {
         CliCommand::Train(args) => AppCommand::Train(TrainConfig {
             mode: args.mode.into(),
             style: args.style.into(),
+            tie_lm_head: args.tie_lm_head,
+            input_rmsnorm: args.input_rmsnorm,
             steps: args.steps,
             data_path: args.data,
             seed: args.seed,
@@ -148,9 +154,28 @@ mod tests {
 
         assert_eq!(config.mode, Mode::Scalar);
         assert_eq!(config.style, Style::Futuristic);
+        assert!(config.tie_lm_head);
+        assert!(!config.input_rmsnorm);
         assert_eq!(config.steps, 500);
         assert_eq!(config.data_path, PathBuf::from("input.txt"));
         assert_eq!(config.seed, 1337);
+    }
+
+    #[test]
+    fn parses_train_variant_overrides() {
+        let command = try_command_from_iter([
+            "microgpt-rs-lab",
+            "train",
+            "--tie-lm-head=false",
+            "--input-rmsnorm=true",
+        ])
+        .expect("valid train command");
+        let AppCommand::Train(config) = command else {
+            panic!("expected train command");
+        };
+
+        assert!(!config.tie_lm_head);
+        assert!(config.input_rmsnorm);
     }
 
     #[test]

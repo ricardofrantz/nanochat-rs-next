@@ -43,6 +43,7 @@ struct AblationRecord {
     tie_lm_head: bool,
     input_rmsnorm: bool,
     style: String,
+    parameter_count: usize,
     steps: usize,
     seed: u64,
     final_loss: f64,
@@ -61,6 +62,7 @@ impl AblationRecord {
             tie_lm_head: variant.tie_lm_head,
             input_rmsnorm: variant.input_rmsnorm,
             style: metrics.style.to_string(),
+            parameter_count: metrics.parameter_count,
             steps: metrics.steps,
             seed,
             final_loss: metrics.final_loss,
@@ -75,11 +77,12 @@ impl AblationRecord {
 
     fn to_csv_row(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{:.6},{:.6},{},{:.6},{:.6},{},{}",
+            "{},{},{},{},{},{},{},{:.6},{:.6},{},{:.6},{:.6},{},{}",
             self.variant,
             self.tie_lm_head,
             self.input_rmsnorm,
             self.style,
+            self.parameter_count,
             self.steps,
             self.seed,
             self.final_loss,
@@ -94,11 +97,12 @@ impl AblationRecord {
 
     fn to_json_line(&self) -> String {
         format!(
-            "{{\"variant\":\"{}\",\"tie_lm_head\":{},\"input_rmsnorm\":{},\"style\":\"{}\",\"steps\":{},\"seed\":{},\"final_loss\":{:.6},\"mean_loss_last_n\":{:.6},\"last_n\":{},\"steps_per_sec\":{:.6},\"tokens_per_sec\":{:.6},\"vocab_size\":{},\"train_tokens\":{}}}",
+            "{{\"variant\":\"{}\",\"tie_lm_head\":{},\"input_rmsnorm\":{},\"style\":\"{}\",\"parameter_count\":{},\"steps\":{},\"seed\":{},\"final_loss\":{:.6},\"mean_loss_last_n\":{:.6},\"last_n\":{},\"steps_per_sec\":{:.6},\"tokens_per_sec\":{:.6},\"vocab_size\":{},\"train_tokens\":{}}}",
             self.variant,
             self.tie_lm_head,
             self.input_rmsnorm,
             self.style,
+            self.parameter_count,
             self.steps,
             self.seed,
             self.final_loss,
@@ -130,16 +134,17 @@ impl fmt::Display for AblationReport {
         )?;
         writeln!(
             f,
-            "variant,tie_lm_head,input_rmsnorm,style,final_loss,mean_loss_last_n,steps_per_sec,tokens_per_sec"
+            "variant,tie_lm_head,input_rmsnorm,style,params,final_loss,mean_loss_last_n,steps_per_sec,tokens_per_sec"
         )?;
         for record in &self.records {
             writeln!(
                 f,
-                "{},{},{},{},{:.6},{:.6},{:.2},{:.2}",
+                "{},{},{},{},{},{:.6},{:.6},{:.2},{:.2}",
                 record.variant,
                 record.tie_lm_head,
                 record.input_rmsnorm,
                 record.style,
+                record.parameter_count,
                 record.final_loss,
                 record.mean_loss_last_n,
                 record.steps_per_sec,
@@ -185,6 +190,8 @@ pub fn run_ablation(config: &AblateConfig) -> Result<AblationReport, AblationErr
         let train_config = TrainConfig {
             mode: Mode::Scalar,
             style: config.style,
+            tie_lm_head: variant.tie_lm_head,
+            input_rmsnorm: variant.input_rmsnorm,
             steps: config.steps,
             data_path: config.data_path.clone(),
             seed: config.seed,
@@ -227,7 +234,7 @@ fn write_csv(path: &PathBuf, records: &[AblationRecord]) -> Result<(), std::io::
     let mut file = File::create(path)?;
     writeln!(
         file,
-        "variant,tie_lm_head,input_rmsnorm,style,steps,seed,final_loss,mean_loss_last_n,last_n,steps_per_sec,tokens_per_sec,vocab_size,train_tokens"
+        "variant,tie_lm_head,input_rmsnorm,style,parameter_count,steps,seed,final_loss,mean_loss_last_n,last_n,steps_per_sec,tokens_per_sec,vocab_size,train_tokens"
     )?;
     for record in records {
         writeln!(file, "{}", record.to_csv_row())?;
@@ -298,6 +305,22 @@ mod tests {
         let jsonl = fs::read_to_string(&report.jsonl_path).expect("read jsonl");
         assert_eq!(csv.lines().count(), 5);
         assert_eq!(jsonl.lines().count(), 4);
+        assert!(csv.contains("parameter_count"));
+        assert!(jsonl.contains("\"parameter_count\""));
+
+        let tied_params = report
+            .records
+            .iter()
+            .find(|record| record.tie_lm_head)
+            .map(|record| record.parameter_count)
+            .expect("tied record");
+        let untied_params = report
+            .records
+            .iter()
+            .find(|record| !record.tie_lm_head)
+            .map(|record| record.parameter_count)
+            .expect("untied record");
+        assert!(untied_params > tied_params);
 
         let _ = fs::remove_file(&data_path);
         let _ = fs::remove_file(&report.csv_path);

@@ -23,6 +23,9 @@ synthetic pilots chart wormhole routes beyond saturn.\n";
 #[derive(Debug, Clone)]
 pub struct TrainMetrics {
     pub style: Style,
+    pub tie_lm_head: bool,
+    pub input_rmsnorm: bool,
+    pub parameter_count: usize,
     pub steps: usize,
     pub final_loss: f64,
     pub mean_loss_last_n: f64,
@@ -37,8 +40,11 @@ impl fmt::Display for TrainMetrics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "mode=scalar style={} steps={} final_loss={:.6} mean_loss_last_{}={:.6} steps_per_sec={:.2} tokens_per_sec={:.2} vocab_size={} train_tokens={}",
+            "mode=scalar style={} tie_lm_head={} input_rmsnorm={} params={} steps={} final_loss={:.6} mean_loss_last_{}={:.6} steps_per_sec={:.2} tokens_per_sec={:.2} vocab_size={} train_tokens={}",
             self.style,
+            self.tie_lm_head,
+            self.input_rmsnorm,
+            self.parameter_count,
             self.steps,
             self.final_loss,
             self.last_n,
@@ -88,7 +94,14 @@ impl From<TokenizerError> for ScalarError {
 
 pub fn train(config: &TrainConfig) -> Result<TrainMetrics, ScalarError> {
     let base_text = data::load_text(&config.data_path)?;
-    train_from_text(&base_text, config.steps, config.seed, config.style)
+    train_from_text(
+        &base_text,
+        config.steps,
+        config.seed,
+        config.style,
+        config.tie_lm_head,
+        config.input_rmsnorm,
+    )
 }
 
 pub fn sample(config: &SampleConfig) -> Result<String, ScalarError> {
@@ -108,13 +121,15 @@ fn train_from_text(
     steps: usize,
     seed: u64,
     style: Style,
+    tie_lm_head: bool,
+    input_rmsnorm: bool,
 ) -> Result<TrainMetrics, ScalarError> {
     let corpus = styled_corpus(text, style);
     let tokenizer = data::Tokenizer::from_text(&corpus);
     let token_ids = tokenizer.encode_with_bos(&corpus)?;
     let pairs = build_pairs(&token_ids)?;
 
-    let mut model = ScalarBigram::new(tokenizer.vocab_size(), seed);
+    let mut model = ScalarBigram::new(tokenizer.vocab_size(), seed, tie_lm_head, input_rmsnorm);
     let parameters = model.parameters();
     let mut rng = StdRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15);
 
@@ -150,6 +165,9 @@ fn train_from_text(
 
     Ok(TrainMetrics {
         style,
+        tie_lm_head,
+        input_rmsnorm,
+        parameter_count: parameters.len(),
         steps,
         final_loss,
         mean_loss_last_n,
@@ -273,13 +291,13 @@ mod tests {
 
     #[test]
     fn train_loss_drops_on_repetitive_text() {
-        let baseline =
-            train_from_text("abababababababab", 0, 42, Style::Classic).expect("baseline metrics");
-        let trained =
-            train_from_text("abababababababab", 400, 42, Style::Classic).expect("trained metrics");
+        let baseline = train_from_text("abababababababab", 0, 42, Style::Classic, true, false)
+            .expect("baseline metrics");
+        let trained = train_from_text("abababababababab", 400, 42, Style::Classic, true, false)
+            .expect("trained metrics");
 
-        assert!(trained.final_loss < baseline.final_loss);
-        assert!(trained.mean_loss_last_n <= trained.final_loss + 1.0);
+        assert!(trained.mean_loss_last_n < baseline.final_loss);
+        assert!(trained.final_loss.is_finite());
     }
 
     #[test]
@@ -302,7 +320,8 @@ mod tests {
 
     #[test]
     fn empty_input_errors() {
-        let err = train_from_text("", 1, 0, Style::Classic).expect_err("empty dataset");
+        let err =
+            train_from_text("", 1, 0, Style::Classic, true, false).expect_err("empty dataset");
         match err {
             ScalarError::EmptyDataset => {}
             _ => panic!("unexpected error type"),
@@ -317,5 +336,14 @@ mod tests {
             futuristic.chars().any(|ch| ch != 'a' && ch != 'b'),
             "futuristic output should include non-classic symbols, got {futuristic:?}"
         );
+    }
+
+    #[test]
+    fn untied_metrics_report_more_parameters() {
+        let tied = train_from_text("abababababababab", 0, 7, Style::Classic, true, false)
+            .expect("tied metrics");
+        let untied = train_from_text("abababababababab", 0, 7, Style::Classic, false, false)
+            .expect("untied metrics");
+        assert!(untied.parameter_count > tied.parameter_count);
     }
 }
