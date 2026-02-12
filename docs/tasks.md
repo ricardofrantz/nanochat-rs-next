@@ -146,4 +146,4 @@
 - **Done when**: No warnings
 - [x] Run clippy and fix any warnings
 - [x] Run fmt and fix any formatting
-- [ ] Document in CLAUDE.md
+- [x] Document in CLAUDE.md
