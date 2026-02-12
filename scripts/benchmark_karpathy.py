@@ -226,7 +226,26 @@ def query_gpu_info(require_gpu: bool) -> dict[str, Any]:
     return {"available": bool(devices), "devices": devices}
 
 
-def detect_rust_gpu_backend() -> dict[str, Any]:
+def parse_ours_features(ours_cargo_features: str) -> set[str]:
+    return {
+        feature.strip().lower()
+        for feature in ours_cargo_features.split(",")
+        if feature.strip()
+    }
+
+
+def detect_requested_gpu_backend(ours_cargo_features: str) -> dict[str, Any]:
+    ours_features = parse_ours_features(ours_cargo_features)
+    hints = ["tch", "candle", "wgpu", "cuda", "metal", "vulkan", "opencl", "burn"]
+    matched = [hint for hint in hints if any(hint in feature for feature in ours_features)]
+    return {
+        "gpu_backend_detected": bool(matched),
+        "backend_hints": matched,
+        "requested_features": sorted(ours_features),
+    }
+
+
+def detect_repo_gpu_backend() -> dict[str, Any]:
     cargo_toml = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8").lower()
     hints = ["tch", "candle", "wgpu", "cuda", "metal", "vulkan", "opencl", "burn"]
     matched = [hint for hint in hints if hint in cargo_toml]
@@ -530,9 +549,12 @@ def render_markdown(summary: dict[str, Any]) -> str:
         lines.append(f"- nanochat resolved ref: `{summary['resolved_refs']['nanochat']}`")
     if summary.get("python_torch"):
         pt = summary["python_torch"]
-        lines.append(
-            f"- Python torch: `version={pt.get('torch_version')} cuda_available={pt.get('cuda_available')} cuda_version={pt.get('cuda_version')}`"
-        )
+        if pt.get("ok"):
+            lines.append(
+                f"- Python torch: `version={pt.get('torch_version')} cuda_available={pt.get('cuda_available')} cuda_version={pt.get('cuda_version')}`"
+            )
+        else:
+            lines.append(f"- Python torch: `unavailable error={pt.get('error')}`")
     lines.append(f"- Baseline mode: `{summary['args']['baseline']}`")
     lines.append("")
 
@@ -542,11 +564,22 @@ def render_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- Status: `{ours['status']}`")
     lines.append(f"- Elapsed: `{ours['elapsed_sec']:.3f}s`")
     lines.append(
-        f"- GPU backend detected: `{summary['ours_gpu_backend']['gpu_backend_detected']}`"
+        f"- Requested GPU backend: `{summary['ours_gpu_backend']['gpu_backend_detected']}`"
     )
+    if summary["ours_gpu_backend"]["requested_features"]:
+        lines.append(
+            f"- Requested features: `{', '.join(summary['ours_gpu_backend']['requested_features'])}`"
+        )
     if summary["ours_gpu_backend"]["backend_hints"]:
         lines.append(
-            f"- Backend hints: `{', '.join(summary['ours_gpu_backend']['backend_hints'])}`"
+            f"- Requested backend hints: `{', '.join(summary['ours_gpu_backend']['backend_hints'])}`"
+        )
+    lines.append(
+        f"- Repo has GPU backend support: `{summary['ours_repo_gpu_backend']['gpu_backend_detected']}`"
+    )
+    if summary["ours_repo_gpu_backend"]["backend_hints"]:
+        lines.append(
+            f"- Repo backend hints: `{', '.join(summary['ours_repo_gpu_backend']['backend_hints'])}`"
         )
     ours_metrics = ours.get("metrics", {})
     if ours_metrics:
@@ -678,16 +711,15 @@ def main() -> int:
         "timestamp_utc": stamp,
         "repo_root": str(REPO_ROOT),
         "ours_data_path": str(ours_data_path),
-        "ours_gpu_backend": detect_rust_gpu_backend(),
+        "ours_gpu_backend": detect_requested_gpu_backend(args.ours_cargo_features),
+        "ours_repo_gpu_backend": detect_repo_gpu_backend(),
         "gpu": gpu_info,
         "args": vars(args),
         "resolved_refs": {},
         "runs": {},
     }
 
-    ours_features = {
-        feature.strip() for feature in args.ours_cargo_features.split(",") if feature.strip()
-    }
+    ours_features = parse_ours_features(args.ours_cargo_features)
     needs_torch_runtime = args.require_gpu or ("tch-backend" in ours_features)
     python_torch = ensure_ours_tch_deps(
         args.install_deps and needs_torch_runtime,
