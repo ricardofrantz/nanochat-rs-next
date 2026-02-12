@@ -8,7 +8,7 @@ use crate::data::{self, Tokenizer, TokenizerError};
 use crate::eval::validate_prompt_length;
 
 use super::value::Value;
-use super::{ScalarError, TrainMetrics, build_pairs, styled_corpus};
+use super::{ScalarError, TrainMetrics, VAL_FRACTION, build_pairs, should_eval, styled_corpus};
 
 const MINI_GPT_EMBD: usize = 16;
 const MINI_GPT_HEADS: usize = 4;
@@ -21,6 +21,8 @@ const MINI_GPT_LOG_EPS: f64 = 1e-12;
 const MINI_GPT_RMS_EPS: f64 = 1e-5;
 const MINI_GPT_LEARNING_RATE: f64 = 0.02;
 const MINI_GPT_LOSS_WINDOW: usize = 50;
+const MINI_GPT_EVAL_EVERY: usize = 20;
+const MINI_GPT_EVAL_WINDOWS: usize = 32;
 
 pub(super) fn train_from_text(
     text: &str,
@@ -33,23 +35,28 @@ pub(super) fn train_from_text(
     let corpus = styled_corpus(text, style);
     let tokenizer = Tokenizer::from_text(&corpus);
     let token_ids = tokenizer.encode_with_bos(&corpus)?;
-    let pairs = build_pairs(&token_ids)?;
+    let (train_token_ids, val_token_ids) = split_train_val_tokens(&token_ids)?;
+    let train_pairs = build_pairs(&train_token_ids)?;
 
     let mut model = ScalarMiniGpt::new(tokenizer.vocab_size(), seed, tie_lm_head, input_rmsnorm);
     let parameters = model.parameters();
     let mut rng = StdRng::seed_from_u64(seed ^ 0xA36C_D6F2_15B3_9241);
 
     let mut losses = Vec::with_capacity(steps.max(1));
+    let mut val_loss = Some(mean_window_loss(&mut model, &val_token_ids));
     let started = Instant::now();
 
     if steps == 0 {
-        let window = select_training_window(&token_ids, &mut rng);
-        losses.push(model.loss_for_tokens(window).data());
+        losses.push(mean_window_loss(&mut model, &train_token_ids));
     } else {
-        for _ in 0..steps {
-            let window = select_training_window(&token_ids, &mut rng);
+        for step in 0..steps {
+            let window = select_training_window(&train_token_ids, &mut rng);
             let loss = model.train_step(window, MINI_GPT_LEARNING_RATE, &parameters);
             losses.push(loss);
+            let step_idx = step + 1;
+            if should_eval(step_idx, steps, MINI_GPT_EVAL_EVERY) {
+                val_loss = Some(mean_window_loss(&mut model, &val_token_ids));
+            }
         }
     }
 
@@ -76,12 +83,13 @@ pub(super) fn train_from_text(
         parameter_count: parameters.len(),
         steps,
         final_loss,
+        val_loss,
         mean_loss_last_n,
         last_n,
         steps_per_sec,
         tokens_per_sec,
         vocab_size: tokenizer.vocab_size(),
-        train_tokens: pairs.len(),
+        train_tokens: train_pairs.len(),
     })
 }
 
@@ -352,6 +360,42 @@ fn select_training_window<'a>(token_ids: &'a [usize], rng: &mut StdRng) -> &'a [
     &token_ids[start..start + MINI_GPT_BLOCK_SIZE + 1]
 }
 
+fn mean_window_loss(model: &mut ScalarMiniGpt, token_ids: &[usize]) -> f64 {
+    if token_ids.len() <= MINI_GPT_BLOCK_SIZE + 1 {
+        return model.loss_for_tokens(token_ids).data();
+    }
+    let max_start = token_ids.len() - (MINI_GPT_BLOCK_SIZE + 1);
+    let step = (max_start / MINI_GPT_EVAL_WINDOWS.max(1)).max(1);
+
+    let mut total = 0.0;
+    let mut count = 0usize;
+    let mut start = 0usize;
+    while start <= max_start && count < MINI_GPT_EVAL_WINDOWS {
+        total += model
+            .loss_for_tokens(&token_ids[start..start + MINI_GPT_BLOCK_SIZE + 1])
+            .data();
+        count += 1;
+        start += step;
+    }
+    total / (count as f64)
+}
+
+fn split_train_val_tokens(token_ids: &[usize]) -> Result<(Vec<usize>, Vec<usize>), ScalarError> {
+    let _ = build_pairs(token_ids)?;
+    let (train_tokens, val_tokens) = data::split_train_val(token_ids, VAL_FRACTION);
+    let train_tokens = if build_pairs(&train_tokens).is_ok() {
+        train_tokens
+    } else {
+        token_ids.to_vec()
+    };
+    let val_tokens = if build_pairs(&val_tokens).is_ok() {
+        val_tokens
+    } else {
+        train_tokens.clone()
+    };
+    Ok((train_tokens, val_tokens))
+}
+
 fn sample_from_logits(
     logits: &[Value],
     temperature: f64,
@@ -498,5 +542,30 @@ mod tests {
             ScalarError::EvalGuard(_) => {}
             _ => panic!("unexpected error type"),
         }
+    }
+
+    #[test]
+    fn mini_gpt_reports_validation_loss() {
+        let text = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let metrics = train_from_text(text, 5, 19, Style::Classic, true, true).expect("metrics");
+
+        let tokenizer = crate::data::Tokenizer::from_text(text);
+        let token_ids = tokenizer
+            .encode_with_bos(text)
+            .expect("token ids should encode");
+        let total_pairs = token_ids.len() - 1;
+
+        assert!(
+            metrics.train_tokens < total_pairs,
+            "train split should hold out validation tokens"
+        );
+        assert!(
+            metrics.val_loss.is_some(),
+            "validation loss should be reported"
+        );
+        assert!(
+            metrics.val_loss.expect("val loss exists").is_finite(),
+            "validation loss should be finite"
+        );
     }
 }

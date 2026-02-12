@@ -18,6 +18,12 @@ const DEFAULT_LEARNING_RATE: f64 = 0.1;
 const LOSS_WINDOW: usize = 50;
 const RMS_EPS: f64 = 1e-8;
 const LOG_EPS: f64 = 1e-12;
+const VAL_FRACTION: f32 = 0.1;
+const EVAL_EVERY: usize = 20;
+const EVAL_PAIRS: usize = 1024;
+const WARMUP_RATIO: f64 = 0.0;
+const WARMDOWN_RATIO: f64 = 0.5;
+const FINAL_LR_FRAC: f64 = 0.0;
 const FUTURISTIC_CORPUS: &str = "\
 neon skylines hum over orbital transit lanes.\n\
 quantum couriers sync with neural uplinks at dawn.\n\
@@ -35,6 +41,7 @@ pub struct TrainMetrics {
     pub parameter_count: usize,
     pub steps: usize,
     pub final_loss: f64,
+    pub val_loss: Option<f64>,
     pub mean_loss_last_n: f64,
     pub last_n: usize,
     pub steps_per_sec: f64,
@@ -47,7 +54,7 @@ impl fmt::Display for TrainMetrics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "mode=tensor style={} tie_lm_head={} input_rmsnorm={} backend={} device={} using_gpu={} params={} steps={} final_loss={:.6} mean_loss_last_{}={:.6} steps_per_sec={:.2} tokens_per_sec={:.2} vocab_size={} train_tokens={}",
+            "mode=tensor style={} tie_lm_head={} input_rmsnorm={} backend={} device={} using_gpu={} params={} steps={} final_loss={:.6} val_loss={} mean_loss_last_{}={:.6} steps_per_sec={:.2} tokens_per_sec={:.2} vocab_size={} train_tokens={}",
             self.style,
             self.tie_lm_head,
             self.input_rmsnorm,
@@ -57,6 +64,9 @@ impl fmt::Display for TrainMetrics {
             self.parameter_count,
             self.steps,
             self.final_loss,
+            self.val_loss
+                .map(|loss| format!("{loss:.6}"))
+                .unwrap_or_else(|| "none".to_string()),
             self.last_n,
             self.mean_loss_last_n,
             self.steps_per_sec,
@@ -290,22 +300,27 @@ fn train_from_text_cpu(
     let corpus = styled_corpus(text, style);
     let tokenizer = data::Tokenizer::from_text(&corpus);
     let token_ids = tokenizer.encode_with_bos(&corpus)?;
-    let pairs = build_pairs(&token_ids)?;
+    let (train_pairs, val_pairs) = split_train_val_pairs(&token_ids)?;
 
     let mut model = TensorBigram::new(tokenizer.vocab_size(), seed, tie_lm_head, input_rmsnorm);
     let mut rng = StdRng::seed_from_u64(seed ^ 0xD1B5_4A32_44C1_AA77);
 
     let mut losses = Vec::with_capacity(steps.max(1));
+    let mut val_loss = Some(mean_nll_loss_cpu(&model, eval_pairs_slice(&val_pairs)));
     let started = Instant::now();
     if steps == 0 {
-        let (context_id, target_id) = pairs[0];
-        losses.push(model.nll_loss(context_id, target_id));
+        losses.push(mean_nll_loss_cpu(&model, eval_pairs_slice(&train_pairs)));
     } else {
-        for _ in 0..steps {
-            let pair_idx = rng.gen_range(0..pairs.len());
-            let (context_id, target_id) = pairs[pair_idx];
-            let loss = model.train_step(context_id, target_id, DEFAULT_LEARNING_RATE);
+        for step in 0..steps {
+            let pair_idx = rng.gen_range(0..train_pairs.len());
+            let (context_id, target_id) = train_pairs[pair_idx];
+            let lr = DEFAULT_LEARNING_RATE * lr_multiplier(step, steps);
+            let loss = model.train_step(context_id, target_id, lr);
             losses.push(loss);
+            let step_idx = step + 1;
+            if should_eval(step_idx, steps, EVAL_EVERY) {
+                val_loss = Some(mean_nll_loss_cpu(&model, eval_pairs_slice(&val_pairs)));
+            }
         }
     }
 
@@ -334,12 +349,13 @@ fn train_from_text_cpu(
         parameter_count: model.parameter_count(),
         steps,
         final_loss,
+        val_loss,
         mean_loss_last_n,
         last_n,
         steps_per_sec,
         tokens_per_sec,
         vocab_size: tokenizer.vocab_size(),
-        train_tokens: pairs.len(),
+        train_tokens: train_pairs.len(),
     })
 }
 
@@ -355,7 +371,7 @@ fn train_from_text_tch(
     let corpus = styled_corpus(text, style);
     let tokenizer = data::Tokenizer::from_text(&corpus);
     let token_ids = tokenizer.encode_with_bos(&corpus)?;
-    let pairs = build_pairs(&token_ids)?;
+    let (train_pairs, val_pairs) = split_train_val_pairs(&token_ids)?;
 
     let device = resolve_tch_device();
     let device_label = tch_device_label(device);
@@ -388,27 +404,28 @@ fn train_from_text_tch(
     let mut optimizer = nn::AdamW::default().build(&vs, DEFAULT_LEARNING_RATE)?;
     let mut rng = StdRng::seed_from_u64(seed ^ 0xD1B5_4A32_44C1_AA77);
     let mut losses = Vec::with_capacity(steps.max(1));
+    let mut val_loss = Some(mean_nll_loss_tch(
+        &token_embedding,
+        lm_head.as_ref(),
+        eval_pairs_slice(&val_pairs),
+        input_rmsnorm,
+        device,
+    ));
     let started = Instant::now();
 
     if steps == 0 {
-        let (context_id, target_id) = pairs[0];
-        let context =
-            Tensor::from_slice(&[i64::try_from(context_id).expect("context id fits i64")])
-                .to(device);
-        let target =
-            Tensor::from_slice(&[i64::try_from(target_id).expect("target id fits i64")]).to(device);
         let loss = tch_forward_loss(
             &token_embedding,
             lm_head.as_ref(),
-            &context,
-            &target,
+            &pairs_to_tensor(eval_pairs_slice(&train_pairs), device, PairField::Context),
+            &pairs_to_tensor(eval_pairs_slice(&train_pairs), device, PairField::Target),
             input_rmsnorm,
         );
         losses.push(loss.double_value(&[]));
     } else {
-        for _ in 0..steps {
-            let pair_idx = rng.gen_range(0..pairs.len());
-            let (context_id, target_id) = pairs[pair_idx];
+        for step in 0..steps {
+            let pair_idx = rng.gen_range(0..train_pairs.len());
+            let (context_id, target_id) = train_pairs[pair_idx];
             let context =
                 Tensor::from_slice(&[i64::try_from(context_id).expect("context id fits i64")])
                     .to(device);
@@ -423,9 +440,21 @@ fn train_from_text_tch(
                 &target,
                 input_rmsnorm,
             );
+            let lr = DEFAULT_LEARNING_RATE * lr_multiplier(step, steps);
+            optimizer.set_lr(lr);
             let loss_value = loss.double_value(&[]);
             optimizer.backward_step(&loss);
             losses.push(loss_value);
+            let step_idx = step + 1;
+            if should_eval(step_idx, steps, EVAL_EVERY) {
+                val_loss = Some(mean_nll_loss_tch(
+                    &token_embedding,
+                    lm_head.as_ref(),
+                    eval_pairs_slice(&val_pairs),
+                    input_rmsnorm,
+                    device,
+                ));
+            }
         }
     }
 
@@ -454,12 +483,13 @@ fn train_from_text_tch(
         parameter_count,
         steps,
         final_loss,
+        val_loss,
         mean_loss_last_n,
         last_n,
         steps_per_sec,
         tokens_per_sec,
         vocab_size: tokenizer.vocab_size(),
-        train_tokens: pairs.len(),
+        train_tokens: train_pairs.len(),
     })
 }
 
@@ -505,6 +535,44 @@ fn tch_forward_loss(
     };
     let logits = hidden.matmul(&projection.transpose(0, 1));
     logits.cross_entropy_for_logits(target)
+}
+
+#[cfg(feature = "tch-backend")]
+#[derive(Clone, Copy)]
+enum PairField {
+    Context,
+    Target,
+}
+
+#[cfg(feature = "tch-backend")]
+fn pairs_to_tensor(pairs: &[(usize, usize)], device: Device, field: PairField) -> Tensor {
+    let values: Vec<i64> = pairs
+        .iter()
+        .map(|(context_id, target_id)| {
+            let value = match field {
+                PairField::Context => *context_id,
+                PairField::Target => *target_id,
+            };
+            i64::try_from(value).expect("token id fits i64")
+        })
+        .collect();
+    Tensor::from_slice(&values).to(device)
+}
+
+#[cfg(feature = "tch-backend")]
+fn mean_nll_loss_tch(
+    token_embedding: &Tensor,
+    lm_head: Option<&Tensor>,
+    pairs: &[(usize, usize)],
+    input_rmsnorm: bool,
+    device: Device,
+) -> f64 {
+    let context = pairs_to_tensor(pairs, device, PairField::Context);
+    let target = pairs_to_tensor(pairs, device, PairField::Target);
+    tch::no_grad(|| {
+        let loss = tch_forward_loss(token_embedding, lm_head, &context, &target, input_rmsnorm);
+        loss.double_value(&[])
+    })
 }
 
 fn sample_from_text(
@@ -698,6 +766,57 @@ fn apply_futuristic_boost(
     }
 }
 
+fn eval_pairs_slice(pairs: &[(usize, usize)]) -> &[(usize, usize)] {
+    let eval_len = pairs.len().min(EVAL_PAIRS);
+    &pairs[..eval_len]
+}
+
+fn mean_nll_loss_cpu(model: &TensorBigram, pairs: &[(usize, usize)]) -> f64 {
+    let total = pairs
+        .iter()
+        .map(|(context_id, target_id)| model.nll_loss(*context_id, *target_id))
+        .sum::<f64>();
+    total / (pairs.len() as f64)
+}
+
+fn split_train_val_pairs(
+    token_ids: &[usize],
+) -> Result<(Vec<(usize, usize)>, Vec<(usize, usize)>), TensorError> {
+    let (train_tokens, val_tokens) = data::split_train_val(token_ids, VAL_FRACTION);
+    let train_pairs = match build_pairs(&train_tokens) {
+        Ok(pairs) => pairs,
+        Err(_) => build_pairs(token_ids)?,
+    };
+    let val_pairs = match build_pairs(&val_tokens) {
+        Ok(pairs) => pairs,
+        Err(_) => train_pairs.clone(),
+    };
+    Ok((train_pairs, val_pairs))
+}
+
+fn should_eval(step: usize, total_steps: usize, eval_every: usize) -> bool {
+    if step == total_steps {
+        return true;
+    }
+    eval_every > 0 && step % eval_every == 0
+}
+
+fn lr_multiplier(step: usize, total_steps: usize) -> f64 {
+    if total_steps == 0 {
+        return 1.0;
+    }
+    let warmup_iters = (WARMUP_RATIO * (total_steps as f64)).round() as usize;
+    let warmdown_iters = (WARMDOWN_RATIO * (total_steps as f64)).round() as usize;
+    if warmup_iters > 0 && step < warmup_iters {
+        return (step + 1) as f64 / (warmup_iters as f64);
+    }
+    if warmdown_iters == 0 || step <= total_steps.saturating_sub(warmdown_iters) {
+        return 1.0;
+    }
+    let progress = (total_steps - step) as f64 / (warmdown_iters as f64);
+    progress + (1.0 - progress) * FINAL_LR_FRAC
+}
+
 fn build_pairs(token_ids: &[usize]) -> Result<Vec<(usize, usize)>, TensorError> {
     if token_ids.len() < 2 {
         return Err(TensorError::EmptyDataset);
@@ -712,7 +831,7 @@ fn build_pairs(token_ids: &[usize]) -> Result<Vec<(usize, usize)>, TensorError> 
 mod tests {
     use crate::config::Style;
 
-    use super::{TensorError, sample_from_text, train_from_text};
+    use super::{TensorError, lr_multiplier, sample_from_text, should_eval, train_from_text};
 
     #[test]
     fn train_loss_drops_on_repetitive_text() {
@@ -790,5 +909,42 @@ mod tests {
                 metrics.device
             );
         }
+    }
+
+    #[test]
+    fn train_uses_split_and_reports_validation_loss() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let metrics = train_from_text(text, 5, 29, Style::Classic, true, false).expect("metrics");
+
+        let tokenizer = crate::data::Tokenizer::from_text(text);
+        let token_ids = tokenizer
+            .encode_with_bos(text)
+            .expect("token ids should encode");
+        let total_pairs = token_ids.len() - 1;
+        assert!(
+            metrics.train_tokens < total_pairs,
+            "train split should hold out validation tokens"
+        );
+        assert!(
+            metrics.val_loss.is_some(),
+            "validation loss should be reported"
+        );
+        assert!(
+            metrics.val_loss.expect("val loss exists").is_finite(),
+            "validation loss should be finite"
+        );
+    }
+
+    #[test]
+    fn lr_schedule_matches_upstream_linear_warmdown_shape() {
+        let total_steps = 10;
+        assert!((lr_multiplier(0, total_steps) - 1.0).abs() < 1e-12);
+        assert!((lr_multiplier(5, total_steps) - 1.0).abs() < 1e-12);
+        assert!((lr_multiplier(8, total_steps) - 0.4).abs() < 1e-12);
+        assert!((lr_multiplier(9, total_steps) - 0.2).abs() < 1e-12);
+        assert!((lr_multiplier(10, total_steps) - 0.0).abs() < 1e-12);
+
+        assert!(should_eval(total_steps, total_steps, 20));
+        assert!(!should_eval(7, total_steps, 20));
     }
 }

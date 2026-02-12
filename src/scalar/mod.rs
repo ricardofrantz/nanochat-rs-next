@@ -16,6 +16,9 @@ use self::bigram::{ScalarBigram, build_transition_counts, sample_index};
 
 const DEFAULT_LEARNING_RATE: f64 = 0.1;
 const LOSS_WINDOW: usize = 50;
+pub(super) const VAL_FRACTION: f32 = 0.1;
+const EVAL_EVERY: usize = 20;
+const EVAL_PAIRS: usize = 1024;
 const FUTURISTIC_CORPUS: &str = "\
 neon skylines hum over orbital transit lanes.\n\
 quantum couriers sync with neural uplinks at dawn.\n\
@@ -31,6 +34,7 @@ pub struct TrainMetrics {
     pub parameter_count: usize,
     pub steps: usize,
     pub final_loss: f64,
+    pub val_loss: Option<f64>,
     pub mean_loss_last_n: f64,
     pub last_n: usize,
     pub steps_per_sec: f64,
@@ -43,7 +47,7 @@ impl fmt::Display for TrainMetrics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "mode=scalar model_kind={} style={} tie_lm_head={} input_rmsnorm={} params={} steps={} final_loss={:.6} mean_loss_last_{}={:.6} steps_per_sec={:.2} tokens_per_sec={:.2} vocab_size={} train_tokens={}",
+            "mode=scalar model_kind={} style={} tie_lm_head={} input_rmsnorm={} params={} steps={} final_loss={:.6} val_loss={} mean_loss_last_{}={:.6} steps_per_sec={:.2} tokens_per_sec={:.2} vocab_size={} train_tokens={}",
             self.model_kind,
             self.style,
             self.tie_lm_head,
@@ -51,6 +55,9 @@ impl fmt::Display for TrainMetrics {
             self.parameter_count,
             self.steps,
             self.final_loss,
+            self.val_loss
+                .map(|loss| format!("{loss:.6}"))
+                .unwrap_or_else(|| "none".to_string()),
             self.last_n,
             self.mean_loss_last_n,
             self.steps_per_sec,
@@ -148,6 +155,13 @@ pub fn sample(config: &SampleConfig) -> Result<String, ScalarError> {
     }
 }
 
+pub(super) fn should_eval(step: usize, total_steps: usize, eval_every: usize) -> bool {
+    if step == total_steps {
+        return true;
+    }
+    eval_every > 0 && step % eval_every == 0
+}
+
 fn train_from_text(
     text: &str,
     steps: usize,
@@ -159,24 +173,28 @@ fn train_from_text(
     let corpus = styled_corpus(text, style);
     let tokenizer = data::Tokenizer::from_text(&corpus);
     let token_ids = tokenizer.encode_with_bos(&corpus)?;
-    let pairs = build_pairs(&token_ids)?;
+    let (train_pairs, val_pairs) = split_train_val_pairs(&token_ids)?;
 
     let mut model = ScalarBigram::new(tokenizer.vocab_size(), seed, tie_lm_head, input_rmsnorm);
     let parameters = model.parameters();
     let mut rng = StdRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15);
 
     let mut losses = Vec::with_capacity(steps.max(1));
+    let mut val_loss = Some(mean_nll_loss(&model, eval_pairs_slice(&val_pairs)));
     let started = Instant::now();
 
     if steps == 0 {
-        let (context_id, target_id) = pairs[0];
-        losses.push(model.nll_loss(context_id, target_id).data());
+        losses.push(mean_nll_loss(&model, eval_pairs_slice(&train_pairs)));
     } else {
-        for _ in 0..steps {
-            let pair_idx = rng.gen_range(0..pairs.len());
-            let (context_id, target_id) = pairs[pair_idx];
+        for step in 0..steps {
+            let pair_idx = rng.gen_range(0..train_pairs.len());
+            let (context_id, target_id) = train_pairs[pair_idx];
             let loss = model.train_step(context_id, target_id, DEFAULT_LEARNING_RATE, &parameters);
             losses.push(loss);
+            let step_idx = step + 1;
+            if should_eval(step_idx, steps, EVAL_EVERY) {
+                val_loss = Some(mean_nll_loss(&model, eval_pairs_slice(&val_pairs)));
+            }
         }
     }
 
@@ -203,12 +221,13 @@ fn train_from_text(
         parameter_count: parameters.len(),
         steps,
         final_loss,
+        val_loss,
         mean_loss_last_n,
         last_n,
         steps_per_sec,
         tokens_per_sec,
         vocab_size: tokenizer.vocab_size(),
-        train_tokens: pairs.len(),
+        train_tokens: train_pairs.len(),
     })
 }
 
@@ -306,6 +325,34 @@ fn apply_futuristic_boost(
     }
 }
 
+fn eval_pairs_slice(pairs: &[(usize, usize)]) -> &[(usize, usize)] {
+    let eval_len = pairs.len().min(EVAL_PAIRS);
+    &pairs[..eval_len]
+}
+
+fn mean_nll_loss(model: &ScalarBigram, pairs: &[(usize, usize)]) -> f64 {
+    let total = pairs
+        .iter()
+        .map(|(context_id, target_id)| model.nll_loss(*context_id, *target_id).data())
+        .sum::<f64>();
+    total / (pairs.len() as f64)
+}
+
+fn split_train_val_pairs(
+    token_ids: &[usize],
+) -> Result<(Vec<(usize, usize)>, Vec<(usize, usize)>), ScalarError> {
+    let (train_tokens, val_tokens) = data::split_train_val(token_ids, VAL_FRACTION);
+    let train_pairs = match build_pairs(&train_tokens) {
+        Ok(pairs) => pairs,
+        Err(_) => build_pairs(token_ids)?,
+    };
+    let val_pairs = match build_pairs(&val_tokens) {
+        Ok(pairs) => pairs,
+        Err(_) => train_pairs.clone(),
+    };
+    Ok((train_pairs, val_pairs))
+}
+
 fn build_pairs(token_ids: &[usize]) -> Result<Vec<(usize, usize)>, ScalarError> {
     if token_ids.len() < 2 {
         return Err(ScalarError::EmptyDataset);
@@ -378,5 +425,30 @@ mod tests {
         let untied = train_from_text("abababababababab", 0, 7, Style::Classic, false, false)
             .expect("untied metrics");
         assert!(untied.parameter_count > tied.parameter_count);
+    }
+
+    #[test]
+    fn train_uses_split_and_reports_validation_loss() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let metrics = train_from_text(text, 5, 31, Style::Classic, true, false).expect("metrics");
+
+        let tokenizer = crate::data::Tokenizer::from_text(text);
+        let token_ids = tokenizer
+            .encode_with_bos(text)
+            .expect("token ids should encode");
+        let total_pairs = token_ids.len() - 1;
+
+        assert!(
+            metrics.train_tokens < total_pairs,
+            "train split should hold out validation tokens"
+        );
+        assert!(
+            metrics.val_loss.is_some(),
+            "validation loss should be reported"
+        );
+        assert!(
+            metrics.val_loss.expect("val loss exists").is_finite(),
+            "validation loss should be finite"
+        );
     }
 }
