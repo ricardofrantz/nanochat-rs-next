@@ -193,10 +193,10 @@ impl TensorBigram {
     fn train_step(&mut self, context_id: usize, target_id: usize, learning_rate: f64) -> f64 {
         let vocab_size = self.token_embedding.len();
         let hidden = self.token_embedding[context_id].clone();
-        let hidden_norm = if self.input_rmsnorm {
-            rmsnorm(&hidden)
+        let (hidden_norm, hidden_for_rmsnorm_backward) = if self.input_rmsnorm {
+            (rmsnorm(&hidden), Some(hidden))
         } else {
-            hidden.clone()
+            (hidden, None)
         };
 
         let projection_rows = if self.tie_lm_head {
@@ -231,8 +231,9 @@ impl TensorBigram {
                 if grad == 0.0 {
                     continue;
                 }
+                let scaled_lr = learning_rate * grad;
                 for (col_idx, hidden_value) in hidden_norm.iter().enumerate() {
-                    self.token_embedding[row_idx][col_idx] -= learning_rate * grad * hidden_value;
+                    self.token_embedding[row_idx][col_idx] -= scaled_lr * hidden_value;
                 }
             }
         } else if let Some(lm_head) = self.lm_head.as_mut() {
@@ -240,14 +241,15 @@ impl TensorBigram {
                 if grad == 0.0 {
                     continue;
                 }
+                let scaled_lr = learning_rate * grad;
                 for (col_idx, hidden_value) in hidden_norm.iter().enumerate() {
-                    lm_head[row_idx][col_idx] -= learning_rate * grad * hidden_value;
+                    lm_head[row_idx][col_idx] -= scaled_lr * hidden_value;
                 }
             }
         }
 
-        let hidden_grad = if self.input_rmsnorm {
-            rmsnorm_backward(&hidden, &hidden_grad_norm)
+        let hidden_grad = if let Some(hidden_original) = hidden_for_rmsnorm_backward.as_ref() {
+            rmsnorm_backward(hidden_original, &hidden_grad_norm)
         } else {
             hidden_grad_norm
         };
