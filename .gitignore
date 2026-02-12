@@ -7,3 +7,4 @@ results/*.json
 results/*.md
 results/*_logs/
 external/
+references/nanochat/
