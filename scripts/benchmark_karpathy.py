@@ -235,6 +235,36 @@ def parse_ours_features(ours_cargo_features: str) -> set[str]:
     }
 
 
+def resolve_libtorch_root_from_env() -> pathlib.Path | None:
+    raw = os.environ.get("LIBTORCH")
+    if not raw:
+        return None
+
+    candidate = pathlib.Path(raw).expanduser()
+    if not candidate.exists():
+        return None
+
+    if (candidate / "include").is_dir() and (candidate / "lib").is_dir():
+        return candidate
+
+    if candidate.name == "lib" and (candidate / ".." / "include").is_dir() and (candidate / ".." / "lib").is_dir():
+        return (candidate.parent)
+
+    return None
+
+
+def set_torch_library_path(env: dict[str, str], libtorch_root: pathlib.Path) -> None:
+    lib_dir = libtorch_root / "lib"
+    if not lib_dir.is_dir():
+        return
+    if sys.platform == "darwin":
+        existing = env.get("DYLD_LIBRARY_PATH", "")
+        env["DYLD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else str(lib_dir)
+    else:
+        existing = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else str(lib_dir)
+
+
 def detect_requested_gpu_backend(ours_cargo_features: str) -> dict[str, Any]:
     ours_features = parse_ours_features(ours_cargo_features)
     matched = [hint for hint in GPU_BACKEND_HINTS if any(hint in feature for feature in ours_features)]
@@ -317,6 +347,15 @@ def ensure_ours_tch_deps(
     index_url: str,
     fallback_index_url: str,
 ) -> dict[str, Any]:
+    if resolve_libtorch_root_from_env() is not None:
+        return {
+            "ok": True,
+            "torch_version": "(from LIBTORCH env)",
+            "cuda_available": False,
+            "cuda_version": None,
+            "device_count": 0,
+            "device_names": [],
+        }
     if not install_deps:
         return probe_python_torch_cuda(log_dir)
     install_python_torch_cuda(
@@ -337,25 +376,45 @@ def run_ours_tensor(args: argparse.Namespace, log_dir: pathlib.Path, dataset_pat
         f"--steps {args.ours_steps} --data {shlex.quote(str(dataset_path))} --seed {args.seed}"
     )
     env = os.environ.copy()
-    # Use Python-installed torch as libtorch provider in Colab and similar environments.
-    env["LIBTORCH_USE_PYTORCH"] = "1"
+    # Use preinstalled libtorch when available; only fall back to python probing when needed.
     env.setdefault("LIBTORCH_BYPASS_VERSION_CHECK", "1")
-    torch_lib = run_bash(
-        "python3 - <<'PY'\nimport os, torch\nprint(os.path.join(os.path.dirname(torch.__file__), 'lib'))\nPY",
-        check=False,
-    )
-    if torch_lib["returncode"] == 0:
-        torch_lib_path = torch_lib["output"].strip()
-        if sys.platform == "darwin":
-            existing = env.get("DYLD_LIBRARY_PATH", "")
-            env["DYLD_LIBRARY_PATH"] = (
-                f"{torch_lib_path}:{existing}" if existing else torch_lib_path
+    libtorch_root = resolve_libtorch_root_from_env()
+    if libtorch_root is not None:
+        env["LIBTORCH"] = str(libtorch_root)
+        env["LIBTORCH_USE_PYTORCH"] = "0"
+        env.setdefault("LIBTORCH_BYPASS_VERSION_CHECK", "1")
+        set_torch_library_path(env, libtorch_root)
+        runtime_env = [
+            f"LIBTORCH={shlex.quote(str(libtorch_root))}",
+            "LIBTORCH_USE_PYTORCH=0",
+            "LIBTORCH_BYPASS_VERSION_CHECK=1",
+        ]
+        libtorch_lib_var = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+        libtorch_lib_path = env.get(libtorch_lib_var, "")
+        if libtorch_lib_path:
+            runtime_env.append(
+                f"{libtorch_lib_var}={shlex.quote(libtorch_lib_path)}"
             )
-        else:
-            existing = env.get("LD_LIBRARY_PATH", "")
-            env["LD_LIBRARY_PATH"] = (
-                f"{torch_lib_path}:{existing}" if existing else torch_lib_path
-            )
+        cmd = f"{' '.join(runtime_env)} {cmd}"
+    else:
+        env["LIBTORCH_USE_PYTORCH"] = "1"
+        torch_lib = run_bash(
+            "python3 - <<'PY'\nimport os, torch\nprint(os.path.join(os.path.dirname(torch.__file__), 'lib'))\nPY",
+            env=env,
+            check=False,
+        )
+        if torch_lib["returncode"] == 0:
+            torch_lib_path = torch_lib["output"].strip()
+            if sys.platform == "darwin":
+                existing = env.get("DYLD_LIBRARY_PATH", "")
+                env["DYLD_LIBRARY_PATH"] = (
+                    f"{torch_lib_path}:{existing}" if existing else torch_lib_path
+                )
+            else:
+                existing = env.get("LD_LIBRARY_PATH", "")
+                env["LD_LIBRARY_PATH"] = (
+                    f"{torch_lib_path}:{existing}" if existing else torch_lib_path
+                )
     result = run_bash(cmd, cwd=REPO_ROOT, env=env, check=False)
     write_command_log(log_dir, "ours_tensor", result)
 
