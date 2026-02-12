@@ -1,0 +1,321 @@
+mod bigram;
+pub mod value;
+
+use std::fmt;
+use std::time::Instant;
+
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+
+use crate::config::{SampleConfig, Style, TrainConfig};
+use crate::data::{self, TokenizerError};
+
+use self::bigram::{ScalarBigram, build_transition_counts, sample_index};
+
+const DEFAULT_LEARNING_RATE: f64 = 0.1;
+const LOSS_WINDOW: usize = 50;
+const FUTURISTIC_CORPUS: &str = "\
+neon skylines hum over orbital transit lanes.\n\
+quantum couriers sync with neural uplinks at dawn.\n\
+autonomous swarms calibrate reactor lattices in silence.\n\
+synthetic pilots chart wormhole routes beyond saturn.\n";
+
+#[derive(Debug, Clone)]
+pub struct TrainMetrics {
+    pub style: Style,
+    pub steps: usize,
+    pub final_loss: f64,
+    pub mean_loss_last_n: f64,
+    pub last_n: usize,
+    pub steps_per_sec: f64,
+    pub tokens_per_sec: f64,
+    pub vocab_size: usize,
+    pub train_tokens: usize,
+}
+
+impl fmt::Display for TrainMetrics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "mode=scalar style={} steps={} final_loss={:.6} mean_loss_last_{}={:.6} steps_per_sec={:.2} tokens_per_sec={:.2} vocab_size={} train_tokens={}",
+            self.style,
+            self.steps,
+            self.final_loss,
+            self.last_n,
+            self.mean_loss_last_n,
+            self.steps_per_sec,
+            self.tokens_per_sec,
+            self.vocab_size,
+            self.train_tokens
+        )
+    }
+}
+
+#[derive(Debug)]
+pub enum ScalarError {
+    Io(std::io::Error),
+    Tokenizer(TokenizerError),
+    EmptyDataset,
+    InvalidTemperature(f64),
+}
+
+impl fmt::Display for ScalarError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "{err}"),
+            Self::Tokenizer(err) => write!(f, "{err}"),
+            Self::EmptyDataset => write!(f, "dataset must contain at least one token pair"),
+            Self::InvalidTemperature(value) => {
+                write!(f, "temperature must be finite and > 0, got {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScalarError {}
+
+impl From<std::io::Error> for ScalarError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<TokenizerError> for ScalarError {
+    fn from(err: TokenizerError) -> Self {
+        Self::Tokenizer(err)
+    }
+}
+
+pub fn train(config: &TrainConfig) -> Result<TrainMetrics, ScalarError> {
+    let base_text = data::load_text(&config.data_path)?;
+    train_from_text(&base_text, config.steps, config.seed, config.style)
+}
+
+pub fn sample(config: &SampleConfig) -> Result<String, ScalarError> {
+    let base_text = data::load_text(&config.data_path)?;
+    sample_from_text(
+        &base_text,
+        &config.prompt,
+        config.max_new_tokens,
+        config.temperature,
+        config.seed,
+        config.style,
+    )
+}
+
+fn train_from_text(
+    text: &str,
+    steps: usize,
+    seed: u64,
+    style: Style,
+) -> Result<TrainMetrics, ScalarError> {
+    let corpus = styled_corpus(text, style);
+    let tokenizer = data::Tokenizer::from_text(&corpus);
+    let token_ids = tokenizer.encode_with_bos(&corpus)?;
+    let pairs = build_pairs(&token_ids)?;
+
+    let mut model = ScalarBigram::new(tokenizer.vocab_size(), seed);
+    let parameters = model.parameters();
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15);
+
+    let mut losses = Vec::with_capacity(steps.max(1));
+    let started = Instant::now();
+
+    if steps == 0 {
+        let (context_id, target_id) = pairs[0];
+        losses.push(model.nll_loss(context_id, target_id).data());
+    } else {
+        for _ in 0..steps {
+            let pair_idx = rng.gen_range(0..pairs.len());
+            let (context_id, target_id) = pairs[pair_idx];
+            let loss = model.train_step(context_id, target_id, DEFAULT_LEARNING_RATE, &parameters);
+            losses.push(loss);
+        }
+    }
+
+    let elapsed_seconds = started.elapsed().as_secs_f64();
+    let steps_per_sec = if steps == 0 || elapsed_seconds <= 0.0 {
+        0.0
+    } else {
+        (steps as f64) / elapsed_seconds
+    };
+    let tokens_per_sec = steps_per_sec;
+
+    let last_n = losses.len().min(LOSS_WINDOW);
+    let tail = &losses[losses.len() - last_n..];
+    let mean_loss_last_n = tail.iter().sum::<f64>() / (tail.len() as f64);
+    let final_loss = *losses
+        .last()
+        .expect("losses contains one element when steps=0");
+
+    Ok(TrainMetrics {
+        style,
+        steps,
+        final_loss,
+        mean_loss_last_n,
+        last_n,
+        steps_per_sec,
+        tokens_per_sec,
+        vocab_size: tokenizer.vocab_size(),
+        train_tokens: pairs.len(),
+    })
+}
+
+fn sample_from_text(
+    text: &str,
+    prompt: &str,
+    max_new_tokens: usize,
+    temperature: f64,
+    seed: u64,
+    style: Style,
+) -> Result<String, ScalarError> {
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return Err(ScalarError::InvalidTemperature(temperature));
+    }
+
+    let corpus = styled_corpus(text, style);
+    let tokenizer = data::Tokenizer::from_text(&corpus);
+    let token_ids = tokenizer.encode_with_bos(&corpus)?;
+    let pairs = build_pairs(&token_ids)?;
+    let mut transition_counts = build_transition_counts(tokenizer.vocab_size(), &pairs);
+    if style == Style::Futuristic {
+        apply_futuristic_boost(&mut transition_counts, &tokenizer, tokenizer.bos_id());
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut generated = prompt.to_string();
+    let bos_id = tokenizer.bos_id();
+
+    let mut context_id = if prompt.is_empty() {
+        bos_id
+    } else {
+        let prompt_ids = tokenizer.encode(prompt)?;
+        *prompt_ids
+            .last()
+            .expect("prompt ids non-empty when prompt text is non-empty")
+    };
+
+    for _ in 0..max_new_tokens {
+        let next_id = sample_index(
+            &transition_counts,
+            context_id,
+            bos_id,
+            temperature,
+            &mut rng,
+        );
+        if next_id == bos_id {
+            continue;
+        }
+        let next_char = tokenizer
+            .char_for_id(next_id)
+            .ok_or(TokenizerError::UnknownId(next_id))?;
+        generated.push(next_char);
+        context_id = next_id;
+    }
+
+    Ok(generated)
+}
+
+fn styled_corpus(base: &str, style: Style) -> String {
+    match style {
+        Style::Classic => base.to_string(),
+        Style::Futuristic => format!("{base}\n{FUTURISTIC_CORPUS}"),
+    }
+}
+
+fn apply_futuristic_boost(
+    transition_counts: &mut [Vec<u64>],
+    tokenizer: &data::Tokenizer,
+    bos_id: usize,
+) {
+    const BOOST: u64 = 400;
+    const PHRASES: [&str; 8] = [
+        "neon",
+        "quantum",
+        "neural",
+        "orbital",
+        "reactor",
+        "wormhole",
+        "autonomous",
+        "synthetic",
+    ];
+
+    for phrase in PHRASES {
+        let Ok(ids) = tokenizer.encode(phrase) else {
+            continue;
+        };
+        if ids.is_empty() {
+            continue;
+        }
+
+        transition_counts[bos_id][ids[0]] += BOOST;
+        for pair in ids.windows(2) {
+            transition_counts[pair[0]][pair[1]] += BOOST;
+        }
+    }
+}
+
+fn build_pairs(token_ids: &[usize]) -> Result<Vec<(usize, usize)>, ScalarError> {
+    if token_ids.len() < 2 {
+        return Err(ScalarError::EmptyDataset);
+    }
+    Ok(token_ids
+        .windows(2)
+        .map(|window| (window[0], window[1]))
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::Style;
+
+    use super::{ScalarError, sample_from_text, train_from_text};
+
+    #[test]
+    fn train_loss_drops_on_repetitive_text() {
+        let baseline =
+            train_from_text("abababababababab", 0, 42, Style::Classic).expect("baseline metrics");
+        let trained =
+            train_from_text("abababababababab", 400, 42, Style::Classic).expect("trained metrics");
+
+        assert!(trained.final_loss < baseline.final_loss);
+        assert!(trained.mean_loss_last_n <= trained.final_loss + 1.0);
+    }
+
+    #[test]
+    fn sample_respects_prompt_and_length() {
+        let output = sample_from_text("abababababab", "ab", 12, 1.0, 7, Style::Classic)
+            .expect("sample text");
+        assert!(output.starts_with("ab"));
+        assert_eq!(output.len(), 14);
+    }
+
+    #[test]
+    fn sample_rejects_invalid_temperature() {
+        let err = sample_from_text("abab", "", 5, 0.0, 1, Style::Classic)
+            .expect_err("invalid temperature");
+        match err {
+            ScalarError::InvalidTemperature(value) => assert_eq!(value, 0.0),
+            _ => panic!("unexpected error type"),
+        }
+    }
+
+    #[test]
+    fn empty_input_errors() {
+        let err = train_from_text("", 1, 0, Style::Classic).expect_err("empty dataset");
+        match err {
+            ScalarError::EmptyDataset => {}
+            _ => panic!("unexpected error type"),
+        }
+    }
+
+    #[test]
+    fn futuristic_style_changes_sampling_distribution() {
+        let futuristic = sample_from_text("abababababab", "", 16, 1.0, 9, Style::Futuristic)
+            .expect("futuristic sample");
+        assert!(
+            futuristic.chars().any(|ch| ch != 'a' && ch != 'b'),
+            "futuristic output should include non-classic symbols, got {futuristic:?}"
+        );
+    }
+}

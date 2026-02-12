@@ -27,15 +27,26 @@ The intent is not to outgrow the reference quickly, but to preserve its teaching
 ## Planned CLI
 
 ```bash
-cargo run --release -- train --mode scalar --steps 500
+cargo run --release -- train --mode scalar --style futuristic --steps 500
 cargo run --release -- train --mode tensor --steps 500
-cargo run --release -- ablate --steps 500
+cargo run --release -- ablate --style futuristic --steps 500
+cargo run --release -- sample --mode scalar --style classic --temperature 0.8 --max-new-tokens 120
+cargo run --release -- sample --mode scalar --style futuristic --temperature 0.8 --max-new-tokens 120
 cargo run --release -- sample --mode tensor --temperature 0.6
 ```
 
 ## Current Status
 
-Repository and planning are ready. See `plan.md` before implementation starts.
+Implementation has started:
+
+- Phase 0 baseline CLI skeleton is in place (`train`, `sample`, `ablate`).
+- Phase 1 tokenizer/data utilities are implemented with unit tests.
+- Phase 2 scalar autograd `Value` core is implemented with gradient tests.
+- Phase 3 scalar path now has a working bigram trainer and sampler.
+- Scalar train/sample support style modes: `classic` and `futuristic` (default).
+- Ablation now runs all 4 planned variants and persists style-tagged CSV/JSONL files in `results/`.
+
+Tensor mode is still a stub.
 
 ## Development
 
