@@ -1,11 +1,14 @@
 #![cfg_attr(feature = "tch-backend", allow(dead_code))]
 
+use std::convert::Infallible;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use crate::checkpoint::{CheckpointEvalError, persist_then_eval};
 use crate::config::{SampleConfig, Style, TrainConfig};
 use crate::data::{self, TokenizerError};
 
@@ -249,13 +252,15 @@ impl TensorBigram {
 
 pub fn train(config: &TrainConfig) -> Result<TrainMetrics, TensorError> {
     let base_text = data::load_text(&config.data_path)?;
-    train_from_text(
+    train_from_text_with_checkpoints(
         &base_text,
         config.steps,
         config.seed,
         config.style,
         config.tie_lm_head,
         config.input_rmsnorm,
+        config.checkpoint_every,
+        &config.checkpoint_dir,
     )
 }
 
@@ -271,6 +276,7 @@ pub fn sample(config: &SampleConfig) -> Result<String, TensorError> {
     )
 }
 
+#[cfg(test)]
 fn train_from_text(
     text: &str,
     steps: usize,
@@ -279,13 +285,53 @@ fn train_from_text(
     tie_lm_head: bool,
     input_rmsnorm: bool,
 ) -> Result<TrainMetrics, TensorError> {
+    train_from_text_with_checkpoints(
+        text,
+        steps,
+        seed,
+        style,
+        tie_lm_head,
+        input_rmsnorm,
+        0,
+        Path::new("results/checkpoints"),
+    )
+}
+
+fn train_from_text_with_checkpoints(
+    text: &str,
+    steps: usize,
+    seed: u64,
+    style: Style,
+    tie_lm_head: bool,
+    input_rmsnorm: bool,
+    checkpoint_every: usize,
+    checkpoint_dir: &Path,
+) -> Result<TrainMetrics, TensorError> {
     #[cfg(feature = "tch-backend")]
     {
-        train_from_text_tch(text, steps, seed, style, tie_lm_head, input_rmsnorm)
+        train_from_text_tch(
+            text,
+            steps,
+            seed,
+            style,
+            tie_lm_head,
+            input_rmsnorm,
+            checkpoint_every,
+            checkpoint_dir,
+        )
     }
     #[cfg(not(feature = "tch-backend"))]
     {
-        train_from_text_cpu(text, steps, seed, style, tie_lm_head, input_rmsnorm)
+        train_from_text_cpu(
+            text,
+            steps,
+            seed,
+            style,
+            tie_lm_head,
+            input_rmsnorm,
+            checkpoint_every,
+            checkpoint_dir,
+        )
     }
 }
 
@@ -296,6 +342,8 @@ fn train_from_text_cpu(
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
+    checkpoint_every: usize,
+    checkpoint_dir: &Path,
 ) -> Result<TrainMetrics, TensorError> {
     let corpus = styled_corpus(text, style);
     let tokenizer = data::Tokenizer::from_text(&corpus);
@@ -310,6 +358,15 @@ fn train_from_text_cpu(
     let started = Instant::now();
     if steps == 0 {
         losses.push(mean_nll_loss_cpu(&model, eval_pairs_slice(&train_pairs)));
+        maybe_persist_checkpoint(
+            checkpoint_every,
+            checkpoint_dir,
+            "cpu-native",
+            0,
+            steps,
+            losses[0],
+            val_loss,
+        )?;
     } else {
         for step in 0..steps {
             let pair_idx = rng.gen_range(0..train_pairs.len());
@@ -321,6 +378,15 @@ fn train_from_text_cpu(
             if should_eval(step_idx, steps, EVAL_EVERY) {
                 val_loss = Some(mean_nll_loss_cpu(&model, eval_pairs_slice(&val_pairs)));
             }
+            maybe_persist_checkpoint(
+                checkpoint_every,
+                checkpoint_dir,
+                "cpu-native",
+                step_idx,
+                steps,
+                loss,
+                val_loss,
+            )?;
         }
     }
 
@@ -367,6 +433,8 @@ fn train_from_text_tch(
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
+    checkpoint_every: usize,
+    checkpoint_dir: &Path,
 ) -> Result<TrainMetrics, TensorError> {
     let corpus = styled_corpus(text, style);
     let tokenizer = data::Tokenizer::from_text(&corpus);
@@ -422,6 +490,15 @@ fn train_from_text_tch(
             input_rmsnorm,
         );
         losses.push(loss.double_value(&[]));
+        maybe_persist_checkpoint(
+            checkpoint_every,
+            checkpoint_dir,
+            "tch",
+            0,
+            steps,
+            losses[0],
+            val_loss,
+        )?;
     } else {
         for step in 0..steps {
             let pair_idx = rng.gen_range(0..train_pairs.len());
@@ -455,6 +532,15 @@ fn train_from_text_tch(
                     device,
                 ));
             }
+            maybe_persist_checkpoint(
+                checkpoint_every,
+                checkpoint_dir,
+                "tch",
+                step_idx,
+                steps,
+                loss_value,
+                val_loss,
+            )?;
         }
     }
 
@@ -817,6 +903,56 @@ fn lr_multiplier(step: usize, total_steps: usize) -> f64 {
     progress + (1.0 - progress) * FINAL_LR_FRAC
 }
 
+fn checkpoint_path(checkpoint_dir: &Path, backend: &str, step: usize) -> PathBuf {
+    checkpoint_dir.join(format!("tensor_{backend}_step_{step:06}.ckpt"))
+}
+
+fn checkpoint_payload(step: usize, loss: f64, val_loss: Option<f64>) -> Vec<u8> {
+    format!(
+        "step={step}\nloss={loss:.12}\nval_loss={}\n",
+        val_loss
+            .map(|value| format!("{value:.12}"))
+            .unwrap_or_else(|| "none".to_string())
+    )
+    .into_bytes()
+}
+
+fn should_checkpoint(step: usize, total_steps: usize, checkpoint_every: usize) -> bool {
+    if step == total_steps {
+        return true;
+    }
+    checkpoint_every > 0 && step % checkpoint_every == 0
+}
+
+fn maybe_persist_checkpoint(
+    checkpoint_every: usize,
+    checkpoint_dir: &Path,
+    backend: &str,
+    step: usize,
+    total_steps: usize,
+    loss: f64,
+    val_loss: Option<f64>,
+) -> Result<(), TensorError> {
+    if checkpoint_every == 0 || !should_checkpoint(step, total_steps, checkpoint_every) {
+        return Ok(());
+    }
+    let payload = checkpoint_payload(step, loss, val_loss);
+    let path = checkpoint_path(checkpoint_dir, backend, step);
+    persist_then_eval(
+        &path,
+        &payload,
+        |checkpoint_path| -> Result<(), Infallible> {
+            debug_assert!(checkpoint_path.exists());
+            Ok(())
+        },
+    )
+    .map_err(|err| match err {
+        CheckpointEvalError::Io(io_err) => TensorError::Io(io_err),
+        CheckpointEvalError::Eval(infallible) => match infallible {},
+    })?;
+    Ok(())
+}
+
 fn build_pairs(token_ids: &[usize]) -> Result<Vec<(usize, usize)>, TensorError> {
     if token_ids.len() < 2 {
         return Err(TensorError::EmptyDataset);
@@ -829,6 +965,10 @@ fn build_pairs(token_ids: &[usize]) -> Result<Vec<(usize, usize)>, TensorError> 
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use crate::config::Style;
 
     use super::{TensorError, lr_multiplier, sample_from_text, should_eval, train_from_text};
@@ -946,5 +1086,44 @@ mod tests {
 
         assert!(should_eval(total_steps, total_steps, 20));
         assert!(!should_eval(7, total_steps, 20));
+    }
+
+    #[test]
+    fn train_creates_checkpoints_at_interval_and_final_step() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let checkpoint_dir = PathBuf::from(format!("results/test_artifacts/tensor_ckpt_{unique}"));
+
+        let _ = super::train_from_text_with_checkpoints(
+            "abababababababab",
+            5,
+            41,
+            Style::Classic,
+            true,
+            false,
+            2,
+            &checkpoint_dir,
+        )
+        .expect("training should succeed with checkpoints");
+
+        assert!(
+            checkpoint_dir
+                .join("tensor_cpu-native_step_000002.ckpt")
+                .exists()
+        );
+        assert!(
+            checkpoint_dir
+                .join("tensor_cpu-native_step_000004.ckpt")
+                .exists()
+        );
+        assert!(
+            checkpoint_dir
+                .join("tensor_cpu-native_step_000005.ckpt")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(&checkpoint_dir);
     }
 }

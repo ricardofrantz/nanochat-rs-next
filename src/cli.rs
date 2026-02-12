@@ -86,6 +86,10 @@ struct TrainArgs {
     data: PathBuf,
     #[arg(long, default_value_t = 1337)]
     seed: u64,
+    #[arg(long, default_value_t = 0)]
+    checkpoint_every: usize,
+    #[arg(long, default_value = "results/checkpoints")]
+    checkpoint_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -144,6 +148,8 @@ fn from_cli(cli: Cli) -> AppCommand {
             steps: args.steps,
             data_path: args.data,
             seed: args.seed,
+            checkpoint_every: args.checkpoint_every,
+            checkpoint_dir: args.checkpoint_dir,
         }),
         CliCommand::Sample(args) => AppCommand::Sample(SampleConfig {
             mode: args.mode.into(),
@@ -185,6 +191,8 @@ mod tests {
         assert_eq!(config.steps, 500);
         assert_eq!(config.data_path, PathBuf::from("input.txt"));
         assert_eq!(config.seed, 1337);
+        assert_eq!(config.checkpoint_every, 0);
+        assert_eq!(config.checkpoint_dir, PathBuf::from("results/checkpoints"));
     }
 
     #[test]

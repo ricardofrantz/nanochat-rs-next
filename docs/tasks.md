@@ -134,10 +134,10 @@
 - **Files**: `src/tensor/mod.rs`, `src/checkpoint.rs`
 - **Tests**: Checkpoint file exists on disk at expected intervals during training
 - **Done when**: Tensor training produces checkpoint files and runs callback
-- [ ] Write test for checkpoint creation during training
-- [ ] Add checkpoint interval config to TrainConfig
-- [ ] Wire persist_then_eval into tensor train loop
-- [ ] Implement
+- [x] Write test for checkpoint creation during training
+- [x] Add checkpoint interval config to TrainConfig
+- [x] Wire persist_then_eval into tensor train loop
+- [x] Implement
 
 ### I.3: Add clippy + fmt enforcement [NFR-004]
 - **What**: Ensure `cargo clippy -- -D warnings` and `cargo fmt --check` pass

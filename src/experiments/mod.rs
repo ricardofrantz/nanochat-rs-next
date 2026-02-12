@@ -196,6 +196,8 @@ pub fn run_ablation(config: &AblateConfig) -> Result<AblationReport, AblationErr
             steps: config.steps,
             data_path: config.data_path.clone(),
             seed: config.seed,
+            checkpoint_every: 0,
+            checkpoint_dir: PathBuf::from("results/checkpoints"),
         };
         let metrics = scalar::train(&train_config)?;
         records.push(AblationRecord::from_metrics(variant, &metrics, config.seed));

@@ -56,6 +56,8 @@ pub struct TrainConfig {
     pub steps: usize,
     pub data_path: PathBuf,
     pub seed: u64,
+    pub checkpoint_every: usize,
+    pub checkpoint_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq)]
