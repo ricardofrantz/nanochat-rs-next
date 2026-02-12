@@ -6,5 +6,6 @@ __pycache__/
 results/*.json
 results/*.md
 results/*_logs/
+results/gpu_profile_*/
 external/
 references/nanochat/
