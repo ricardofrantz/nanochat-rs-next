@@ -1,5 +1,5 @@
 [package]
-name = "microgpt-rs-dual"
+name = "microgpt-rs-lab"
 version = "0.1.0"
 edition = "2024"
 

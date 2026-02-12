@@ -1,29 +1,30 @@
-# microgpt-rs-dual
+# microgpt-rs-lab
 
-A minimal Rust implementation of microGPT with two execution modes:
+`microgpt-rs-lab` is a Rust-first reimplementation of Andrej Karpathy's microGPT idea, with two goals:
 
-1. `scalar` mode for educational clarity (close to the original pure-Python structure).
-2. `tensor` mode for practical speed using a Rust tensor backend.
+1. Keep the code readable enough to study end-to-end.
+2. Add a practical path for speed experiments and architecture ablations.
 
-## Why this repo
+## Reference
 
-The goal is to keep the "readable from top to bottom" learning value while also making it useful for measurement and iteration.
+This project is directly inspired by Karpathy's implementation:
 
-## Scope
+- Gist: https://gist.github.com/karpathy/8627fe009c40f57531cb18360106ce95
+- Single-page version: https://karpathy.ai/microgpt.html
 
-- Implement character-level GPT training and inference in Rust.
-- Support side-by-side architectural ablations:
-  - tied vs untied `lm_head`
-  - with vs without input `rmsnorm`
-- Report both quality and speed metrics.
+The intent is not to outgrow the reference quickly, but to preserve its teaching value while making controlled experiments easier in Rust.
 
-## Non-goals (for v1)
+## Planned Modes
 
-- Chasing SOTA benchmarks.
-- Building a full training framework.
-- Multi-node distributed training.
+- `scalar`: educational, explicit operations and gradients.
+- `tensor`: backend-accelerated path for throughput and scaling experiments.
 
-## Planned CLI shape
+## Planned Experiments
+
+- tied vs untied `lm_head`
+- with vs without input `rmsnorm`
+
+## Planned CLI
 
 ```bash
 cargo run --release -- train --mode scalar --steps 500
@@ -32,9 +33,9 @@ cargo run --release -- ablate --steps 500
 cargo run --release -- sample --mode tensor --temperature 0.6
 ```
 
-## Status
+## Current Status
 
-Scaffolded repository. Implementation starts in `plan_2026-02-12.md`.
+Repository and planning are ready. See `plan.md` before implementation starts.
 
 ## Development
 
@@ -42,7 +43,3 @@ Scaffolded repository. Implementation starts in `plan_2026-02-12.md`.
 cargo check
 cargo test
 ```
-
-## License
-
-TBD
