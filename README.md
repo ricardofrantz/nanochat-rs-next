@@ -83,6 +83,21 @@ cargo run --release -- train --mode tensor --steps 500
 LIBTORCH_USE_PYTORCH=1 cargo run --release --features tch-backend -- train --mode tensor --steps 500
 ```
 
+## Run Matrix
+
+Use these presets as a starting point:
+
+- CPU scalar baseline:
+  - `cargo run --release -- train --mode scalar --steps 500`
+- CPU tensor baseline:
+  - `cargo run --release -- train --mode tensor --steps 500`
+- GPU tensor baseline (when `tch` backend is available):
+  - `LIBTORCH_USE_PYTORCH=1 cargo run --release --features tch-backend -- train --mode tensor --steps 500`
+- Deterministic sampling from a checkpoint:
+  - `cargo run --release -- sample --mode tensor --checkpoint-path <path> --seed 42 --temperature 0.8 --max-new-tokens 120`
+- Ablation sweep:
+  - `cargo run --release -- ablate --model-kind bigram --base-seed 42 --steps 120 --checkpoint-interval 40`
+
 ## Benchmark Commands
 
 ```bash
