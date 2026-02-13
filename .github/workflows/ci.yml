@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [master]
+    # CI is scoped to source-code and workflow edits; docs-only changes do not trigger runs.
     paths:
       - 'src/**'
       - 'Cargo.toml'
