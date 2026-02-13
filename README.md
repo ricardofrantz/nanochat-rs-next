@@ -8,6 +8,15 @@
 
 `nanochat-rs-next` is a Rust-first continuation of [`AntigmaLabs/nanochat-rs`](https://github.com/AntigmaLabs/nanochat-rs), benchmarked against [`karpathy/nanochat`](https://github.com/karpathy/nanochat).
 
+## Repository Layout
+
+- `src/`: Rust implementation (CLI, training, sampling, tensor/scalar runtimes, benchmarks, and tests).
+- `scripts/`: Benchmark and utility scripts.
+- `docs/`: Design notes, experimental notes, and reference docs.
+- `references/`: External reference scripts and baselines.
+- `input.txt`: Input corpus file used by example flows.
+- `Cargo.toml` / `Cargo.lock`: Rust manifest and lockfile.
+
 ## Goal
 
 Build a Rust repo that can match or beat `karpathy/nanochat` on:
