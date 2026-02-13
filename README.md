@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/ricardofrantz/nanochat-rs-next/actions/workflows/ci.yml/badge.svg)](https://github.com/ricardofrantz/nanochat-rs-next/actions/workflows/ci.yml)
 
+`nanochat-rs-next` is a small Rust project for training and evaluating tiny language models from a text corpus with a CLI-driven workflow: users pick text data and training/sampling options (mode, model kind, optimizer, scheduler, seed, steps, checkpoints, and output paths), and the tool returns trained checkpoints, generated continuations, and structured benchmark/ablation metrics so model behavior and throughput can be compared reproducibly.
+
 `nanochat-rs-next` is a Rust CLI for training and sampling tiny language models from a text corpus, letting users choose between a pure-Rust scalar engine and a tensor engine, between bigram and mini-gpt model kinds, configure training controls (optimizer, schedule, checkpoints, sampling settings), and get structured outputs like training metrics, generated text, and ablation reports to compare performance, quality, and behavior in reproducible experiments.
 
 `nanochat-rs-next` is a Rust-first continuation of [`AntigmaLabs/nanochat-rs`](https://github.com/AntigmaLabs/nanochat-rs), benchmarked against [`karpathy/nanochat`](https://github.com/karpathy/nanochat).
