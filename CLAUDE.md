@@ -19,32 +19,36 @@ src/
 ├── main.rs          CLI entrypoint → dispatches to scalar/tensor
 ├── lib.rs           Module tree root
 ├── cli.rs           Clap-derived CLI parsing → AppCommand
-├── config.rs        Domain config types (TrainConfig, SampleConfig, AblateConfig)
+├── config.rs        Domain config types (RuntimeConfig, TrainConfig, SampleConfig, AblateConfig)
+├── training.rs      Shared training utilities (LR schedule, transition counts, train/val splits, sampling)
 ├── data/
 │   ├── mod.rs       load_text, split_train_val
 │   └── tokenizer.rs Char-level tokenizer with BOS, encode/decode
 ├── scalar/
-│   ├── mod.rs       Scalar train/sample dispatcher, bigram integration
+│   ├── mod.rs       Scalar train/sample dispatcher, bigram + mini-gpt integration
 │   ├── bigram.rs    ScalarBigram model (autograd Value-based)
 │   ├── minigpt.rs   1-layer GPT scalar path (multi-head attention + MLP)
+│   ├── optimizer.rs AdamW optimizer for scalar autograd parameters
 │   └── value.rs     Autograd engine (Value with Rc<RefCell<Node>>)
 ├── tensor/
-│   └── mod.rs       Tensor bigram: native CPU + optional tch/CUDA backend
+│   └── mod.rs       Tensor bigram + mini-gpt: native CPU + optional tch/CUDA backend
 ├── eval.rs          Prompt-length guard, memory-drift guard
 ├── checkpoint.rs    Atomic persist-then-eval checkpoint pattern
 └── experiments/
     └── mod.rs       Ablation sweep: 4 variants × (tie_lm_head, input_rmsnorm)
 ```
 
-**Data flow**: CLI args → `AppCommand` → mode dispatch (scalar/tensor) → tokenizer → model train/sample → metrics/output.
+**Data flow**: CLI args → `AppCommand` → mode dispatch (scalar/tensor) → tokenizer → `training.rs` shared utils → model train/sample → metrics/output.
 
 **Autograd**: `value.rs` implements a scalar autograd engine (Add, Mul, Pow, Exp, Log, Relu) with topological-sort backward pass. Used by scalar bigram and mini-gpt.
 
-**Tensor mode**: Dual-path — CPU-native `Vec<Vec<f64>>` implementation (default), or `tch` tensors with CUDA when `tch-backend` feature is enabled.
+**Training utilities**: `training.rs` centralizes LR scheduling (linear warmdown), transition count building, train/val splitting, pair construction, and temperature-weighted sampling. Both scalar and tensor modules delegate to it.
+
+**Tensor mode**: Dual-path — CPU-native `Vec<Vec<f64>>` implementation (default), or `tch` tensors with CUDA when `tch-backend` feature is enabled. Supports both bigram and mini-gpt model kinds with checkpointing.
 
 ## Code Conventions
 
-- Enums for modes/variants: `Mode`, `ModelKind`, `Style`
+- Enums for modes/variants: `Mode`, `ModelKind`, `Style`, `Optimizer`
 - Config structs carry all training/sampling parameters
 - `pub(crate)` for internal model APIs; public for module-level `train`/`sample`
 - Error types per module (`ScalarError`, `TensorError`, `AblationError`) with `From` impls
@@ -55,8 +59,8 @@ src/
 
 - **Framework**: built-in `#[test]`
 - **Run**: `cargo test`
-- **Coverage**: 51 tests across all modules
-- **Patterns**: loss-drop verification, round-trip encoding, guard rejection, variant matrix coverage, finite-loss assertions
+- **Coverage**: 62 tests across all modules
+- **Patterns**: loss-drop verification, round-trip encoding, guard rejection, variant matrix coverage, finite-loss assertions, optimizer convergence comparison, checkpoint persistence ordering, Python parity traces
 - **Test artifacts**: written to `results/test_artifacts/`, cleaned up after each test
 
 ## Quality Gates
@@ -69,7 +73,7 @@ src/
 
 ```bash
 cargo check                    # type-check
-cargo test                     # run all 46 tests
+cargo test                     # run all 62 tests
 cargo build --release          # optimized binary
 
 # Scalar bigram (default)
@@ -99,7 +103,6 @@ cargo run --release -- ablate --steps 500
 
 - No distributed training yet
 - Mini-gpt is minimal parity scaffolding, not production
-- Checkpoint lifecycle integration across all train loops is incomplete
 - Char-level tokenizer only (no BPE/subword)
 - Ablation sweep is scalar-bigram only
 
@@ -110,7 +113,11 @@ cargo run --release -- ablate --steps 500
 | `src/scalar/value.rs` | Autograd engine — the computational core |
 | `src/scalar/bigram.rs` | Scalar bigram model with tied/untied LM head |
 | `src/scalar/minigpt.rs` | 1-layer GPT: multi-head attention + ReGLU MLP |
-| `src/tensor/mod.rs` | Tensor bigram with CPU/tch dual backend |
+| `src/scalar/optimizer.rs` | AdamW optimizer for scalar autograd |
+| `src/tensor/mod.rs` | Tensor bigram + mini-gpt with CPU/tch dual backend |
+| `src/training.rs` | Shared training utilities (LR schedule, splits, sampling) |
 | `src/config.rs` | All config types and enums |
 | `src/cli.rs` | CLI argument parsing |
 | `scripts/benchmark_karpathy.py` | Benchmark harness vs upstream nanochat |
+| `scripts/colab_gpu_benchmark.sh` | GPU-first benchmark runner for Colab |
+| `scripts/profile_gpu.sh` | GPU profiling script |

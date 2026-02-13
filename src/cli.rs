@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::config::{
-    AblateConfig, AppCommand, Mode, ModelKind, Optimizer, RuntimeConfig, SampleConfig, Style,
-    TrainConfig,
+    AblateConfig, AppCommand, LrSchedule, Mode, ModelKind, Optimizer, RuntimeConfig, SampleConfig,
+    Style, TrainConfig,
 };
 use crate::training;
 
@@ -52,6 +52,12 @@ enum CliOptimizer {
     AdamW,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliLrSchedule {
+    Linear,
+    Sqrt,
+}
+
 impl From<CliMode> for Mode {
     fn from(mode: CliMode) -> Self {
         match mode {
@@ -88,6 +94,15 @@ impl From<CliOptimizer> for Optimizer {
     }
 }
 
+impl From<CliLrSchedule> for LrSchedule {
+    fn from(schedule: CliLrSchedule) -> Self {
+        match schedule {
+            CliLrSchedule::Linear => Self::Linear,
+            CliLrSchedule::Sqrt => Self::Sqrt,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct RuntimeArgs {
     #[arg(long, value_enum, default_value_t = CliMode::Scalar)]
@@ -108,6 +123,8 @@ struct TrainArgs {
     runtime: RuntimeArgs,
     #[arg(long, value_enum, default_value_t = CliOptimizer::Sgd)]
     optimizer: CliOptimizer,
+    #[arg(long, value_enum, default_value_t = CliLrSchedule::Linear)]
+    lr_schedule: CliLrSchedule,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     tie_lm_head: bool,
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
@@ -170,6 +187,7 @@ fn from_cli(cli: Cli) -> AppCommand {
         CliCommand::Train(args) => AppCommand::Train(TrainConfig {
             runtime: to_runtime(args.runtime),
             optimizer: args.optimizer.into(),
+            lr_schedule: args.lr_schedule.into(),
             tie_lm_head: args.tie_lm_head,
             input_rmsnorm: args.input_rmsnorm,
             steps: args.steps,
@@ -212,6 +230,7 @@ mod tests {
         assert_eq!(config.steps, 500);
         assert_eq!(config.runtime.data_path, PathBuf::from("input.txt"));
         assert_eq!(config.runtime.seed, 1337);
+        assert_eq!(config.lr_schedule, LrSchedule::Linear);
         assert_eq!(config.checkpoint_every, 0);
         assert_eq!(
             config.checkpoint_dir,
@@ -237,6 +256,18 @@ mod tests {
         assert!(!config.tie_lm_head);
         assert!(config.input_rmsnorm);
         assert_eq!(config.optimizer, Optimizer::AdamW);
+        assert_eq!(config.lr_schedule, LrSchedule::Linear);
+    }
+
+    #[test]
+    fn parses_train_sqrt_lr_schedule() {
+        let command = try_command_from_iter(["nanochat-rs-next", "train", "--lr-schedule", "sqrt"])
+            .expect("valid train command");
+        let AppCommand::Train(config) = command else {
+            panic!("expected train command");
+        };
+
+        assert_eq!(config.lr_schedule, LrSchedule::Sqrt);
     }
 
     #[test]

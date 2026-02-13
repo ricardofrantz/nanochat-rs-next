@@ -120,6 +120,7 @@ pub fn train(config: &TrainConfig) -> Result<TrainMetrics, ScalarError> {
         config.steps,
         runtime.seed,
         config.optimizer,
+        config.lr_schedule,
         runtime.style,
         config.tie_lm_head,
         config.input_rmsnorm,
@@ -140,12 +141,14 @@ pub fn sample(config: &SampleConfig) -> Result<String, ScalarError> {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn train_from_text_with_model_kind(
     text: &str,
     model_kind: ModelKind,
     steps: usize,
     seed: u64,
     optimizer: Optimizer,
+    lr_schedule: training::LrSchedule,
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
@@ -156,6 +159,7 @@ pub(crate) fn train_from_text_with_model_kind(
             steps,
             seed,
             optimizer,
+            lr_schedule,
             style,
             tie_lm_head,
             input_rmsnorm,
@@ -165,6 +169,7 @@ pub(crate) fn train_from_text_with_model_kind(
             steps,
             seed,
             optimizer,
+            lr_schedule,
             style,
             tie_lm_head,
             input_rmsnorm,
@@ -182,22 +187,12 @@ pub(crate) fn sample_from_text_with_model_kind(
     style: Style,
 ) -> Result<String, ScalarError> {
     match model_kind {
-        ModelKind::Bigram => sample_from_text(
-            text,
-            prompt,
-            max_new_tokens,
-            temperature,
-            seed,
-            style,
-        ),
-        ModelKind::MiniGpt => minigpt::sample_from_text(
-            text,
-            prompt,
-            max_new_tokens,
-            temperature,
-            seed,
-            style,
-        ),
+        ModelKind::Bigram => {
+            sample_from_text(text, prompt, max_new_tokens, temperature, seed, style)
+        }
+        ModelKind::MiniGpt => {
+            minigpt::sample_from_text(text, prompt, max_new_tokens, temperature, seed, style)
+        }
     }
 }
 
@@ -205,15 +200,18 @@ pub(super) fn should_eval(step: usize, total_steps: usize, eval_every: usize) ->
     training::should_eval(step, total_steps, eval_every)
 }
 
+#[cfg(test)]
 pub(super) fn lr_multiplier(step: usize, total_steps: usize) -> f64 {
-    training::lr_multiplier(step, total_steps)
+    training::lr_multiplier_with_schedule(step, total_steps, training::LrSchedule::Linear)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn train_from_text(
     text: &str,
     steps: usize,
     seed: u64,
     optimizer: Optimizer,
+    lr_schedule: training::LrSchedule,
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
@@ -239,7 +237,7 @@ fn train_from_text(
         for step in 0..steps {
             let pair_idx = rng.gen_range(0..train_pairs.len());
             let (context_id, target_id) = train_pairs[pair_idx];
-            let lr = lr_multiplier(step, steps);
+            let lr = training::lr_multiplier_with_schedule(step, steps, lr_schedule);
             let loss = if let Some(opt) = adamw.as_mut() {
                 for parameter in &parameters {
                     parameter.zero_grad();
@@ -398,6 +396,7 @@ mod tests {
             0,
             42,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
@@ -408,6 +407,7 @@ mod tests {
             400,
             42,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
@@ -438,8 +438,17 @@ mod tests {
 
     #[test]
     fn empty_input_errors() {
-        let err = train_from_text("", 1, 0, Optimizer::Sgd, Style::Classic, true, false)
-            .expect_err("empty dataset");
+        let err = train_from_text(
+            "",
+            1,
+            0,
+            Optimizer::Sgd,
+            training::LrSchedule::Linear,
+            Style::Classic,
+            true,
+            false,
+        )
+        .expect_err("empty dataset");
         match err {
             ScalarError::EmptyDataset => {}
             _ => panic!("unexpected error type"),
@@ -463,6 +472,7 @@ mod tests {
             0,
             7,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
@@ -473,6 +483,7 @@ mod tests {
             0,
             7,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             false,
             false,
@@ -484,8 +495,17 @@ mod tests {
     #[test]
     fn train_uses_split_and_reports_validation_loss() {
         let text = "abcdefghijklmnopqrstuvwxyz";
-        let metrics = train_from_text(text, 5, 31, Optimizer::Sgd, Style::Classic, true, false)
-            .expect("metrics");
+        let metrics = train_from_text(
+            text,
+            5,
+            31,
+            Optimizer::Sgd,
+            training::LrSchedule::Linear,
+            Style::Classic,
+            true,
+            false,
+        )
+        .expect("metrics");
 
         let tokenizer = crate::data::Tokenizer::from_text(text);
         let token_ids = tokenizer
@@ -514,6 +534,7 @@ mod tests {
             200,
             11,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
@@ -524,6 +545,7 @@ mod tests {
             200,
             11,
             Optimizer::AdamW,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,

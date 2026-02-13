@@ -29,12 +29,16 @@ fn main() {
             let mode = config.runtime.mode;
             let output = run_or_exit(
                 mode,
-                || scalar::train(&config)
-                    .map(|value| format!("{value}"))
-                    .map_err(|err| err.to_string()),
-                || tensor::train(&config)
-                    .map(|value| format!("{value}"))
-                    .map_err(|err| err.to_string()),
+                || {
+                    scalar::train(&config)
+                        .map(|value| value.to_string())
+                        .map_err(|err| err.to_string())
+                },
+                || {
+                    tensor::train(&config)
+                        .map(|value| value.to_string())
+                        .map_err(|err| err.to_string())
+                },
                 "train",
             );
             println!("{output}");
@@ -43,12 +47,16 @@ fn main() {
             let mode = config.runtime.mode;
             let output = run_or_exit(
                 mode,
-                || scalar::sample(&config)
-                    .map(|value| format!("{value}"))
-                    .map_err(|err| err.to_string()),
-                || tensor::sample(&config)
-                    .map(|value| format!("{value}"))
-                    .map_err(|err| err.to_string()),
+                || {
+                    scalar::sample(&config)
+                        .map(|value| value.to_string())
+                        .map_err(|err| err.to_string())
+                },
+                || {
+                    tensor::sample(&config)
+                        .map(|value| value.to_string())
+                        .map_err(|err| err.to_string())
+                },
                 "sample",
             );
             println!("{output}");

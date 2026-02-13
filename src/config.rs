@@ -61,6 +61,21 @@ impl fmt::Display for Optimizer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LrSchedule {
+    Linear,
+    Sqrt,
+}
+
+impl fmt::Display for LrSchedule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Linear => write!(f, "linear"),
+            Self::Sqrt => write!(f, "sqrt"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
     pub mode: Mode,
@@ -74,6 +89,7 @@ pub struct RuntimeConfig {
 pub struct TrainConfig {
     pub runtime: RuntimeConfig,
     pub optimizer: Optimizer,
+    pub lr_schedule: LrSchedule,
     pub tie_lm_head: bool,
     pub input_rmsnorm: bool,
     pub steps: usize,

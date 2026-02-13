@@ -10,9 +10,7 @@ use crate::training;
 
 use super::optimizer::{AdamW, AdamWConfig};
 use super::value::Value;
-use super::{
-    ScalarError, TrainMetrics, build_pairs, lr_multiplier, should_eval, styled_corpus,
-};
+use super::{ScalarError, TrainMetrics, build_pairs, should_eval, styled_corpus};
 
 const MINI_GPT_EMBD: usize = 16;
 const MINI_GPT_HEADS: usize = 4;
@@ -28,11 +26,13 @@ const MINI_GPT_ADAMW_LEARNING_RATE: f64 = 0.01;
 const MINI_GPT_LOSS_WINDOW: usize = 50;
 const MINI_GPT_EVAL_WINDOWS: usize = 32;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn train_from_text(
     text: &str,
     steps: usize,
     seed: u64,
     optimizer: Optimizer,
+    lr_schedule: training::LrSchedule,
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
@@ -58,7 +58,7 @@ pub(super) fn train_from_text(
     } else {
         for step in 0..steps {
             let window = select_training_window(&train_token_ids, &mut rng);
-            let lr = lr_multiplier(step, steps);
+            let lr = training::lr_multiplier_with_schedule(step, steps, lr_schedule);
             let loss = if let Some(opt) = adamw.as_mut() {
                 for parameter in &parameters {
                     parameter.zero_grad();
@@ -506,6 +506,7 @@ mod tests {
             0,
             17,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             true,
@@ -516,6 +517,7 @@ mod tests {
             50,
             17,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             true,
@@ -549,8 +551,17 @@ mod tests {
     #[test]
     fn mini_gpt_reports_validation_loss() {
         let text = "abcdefghijklmnopqrstuvwxyz0123456789";
-        let metrics = train_from_text(text, 5, 19, Optimizer::Sgd, Style::Classic, true, true)
-            .expect("metrics");
+        let metrics = train_from_text(
+            text,
+            5,
+            19,
+            Optimizer::Sgd,
+            training::LrSchedule::Linear,
+            Style::Classic,
+            true,
+            true,
+        )
+        .expect("metrics");
 
         let tokenizer = crate::data::Tokenizer::from_text(text);
         let token_ids = tokenizer

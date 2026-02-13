@@ -9,9 +9,9 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::checkpoint::{CheckpointEvalError, persist_then_eval};
-use crate::config::{ModelKind, Optimizer, SampleConfig, Style, TrainConfig};
-use crate::eval::EvalGuardError;
+use crate::config::{LrSchedule, ModelKind, Optimizer, SampleConfig, Style, TrainConfig};
 use crate::data::{self, TokenizerError};
+use crate::eval::EvalGuardError;
 use crate::training;
 
 #[cfg(feature = "tch-backend")]
@@ -42,6 +42,7 @@ type PairSplits = training::PairSplits;
 struct TensorTrainRuntime<'a> {
     checkpoint_every: usize,
     checkpoint_dir: &'a Path,
+    lr_schedule: LrSchedule,
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +286,7 @@ pub fn train(config: &TrainConfig) -> Result<TrainMetrics, TensorError> {
         TensorTrainRuntime {
             checkpoint_every: config.checkpoint_every,
             checkpoint_dir: &config.checkpoint_dir,
+            lr_schedule: config.lr_schedule,
         },
     )
 }
@@ -314,16 +316,13 @@ fn sample_from_text_with_model_kind(
     style: Style,
 ) -> Result<String, TensorError> {
     match model_kind {
-        ModelKind::Bigram => sample_from_text(text, prompt, max_new_tokens, temperature, seed, style),
+        ModelKind::Bigram => {
+            sample_from_text(text, prompt, max_new_tokens, temperature, seed, style)
+        }
         #[cfg(feature = "tch-backend")]
-        ModelKind::MiniGpt => sample_from_text_tch_minigpt(
-            text,
-            prompt,
-            max_new_tokens,
-            temperature,
-            seed,
-            style,
-        ),
+        ModelKind::MiniGpt => {
+            sample_from_text_tch_minigpt(text, prompt, max_new_tokens, temperature, seed, style)
+        }
         #[cfg(not(feature = "tch-backend"))]
         ModelKind::MiniGpt => Err(TensorError::UnsupportedModelKind(model_kind)),
     }
@@ -336,6 +335,7 @@ fn train_from_text(
     seed: u64,
     model_kind: ModelKind,
     optimizer: Optimizer,
+    lr_schedule: LrSchedule,
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
@@ -354,10 +354,12 @@ fn train_from_text(
         TensorTrainRuntime {
             checkpoint_every: 0,
             checkpoint_dir: Path::new(training::DEFAULT_CHECKPOINT_DIR),
+            lr_schedule,
         },
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn train_from_text_with_checkpoints(
     text: &str,
     steps: usize,
@@ -375,8 +377,8 @@ fn train_from_text_with_checkpoints(
             text,
             steps,
             seed,
-            model_kind,
             optimizer,
+            runtime.lr_schedule,
             style,
             tie_lm_head,
             input_rmsnorm,
@@ -387,6 +389,7 @@ fn train_from_text_with_checkpoints(
             steps,
             seed,
             optimizer,
+            runtime.lr_schedule,
             style,
             tie_lm_head,
             input_rmsnorm,
@@ -395,6 +398,7 @@ fn train_from_text_with_checkpoints(
     }
     #[cfg(not(feature = "tch-backend"))]
     {
+        let _ = optimizer; // validated by ensure_tensor_optimizer_support at call site
         if !matches!(model_kind, ModelKind::Bigram) {
             return Err(TensorError::UnsupportedModelKind(model_kind));
         }
@@ -402,8 +406,6 @@ fn train_from_text_with_checkpoints(
             text,
             steps,
             seed,
-            model_kind,
-            optimizer,
             style,
             tie_lm_head,
             input_rmsnorm,
@@ -416,17 +418,11 @@ fn train_from_text_cpu(
     text: &str,
     steps: usize,
     seed: u64,
-    model_kind: ModelKind,
-    optimizer: Optimizer,
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
     runtime: TensorTrainRuntime<'_>,
 ) -> Result<TrainMetrics, TensorError> {
-    if !matches!(model_kind, ModelKind::Bigram) {
-        return Err(TensorError::UnsupportedModelKind(model_kind));
-    }
-    ensure_tensor_optimizer_support(optimizer)?;
     let corpus = styled_corpus(text, style);
     let tokenizer = data::Tokenizer::from_text(&corpus);
     let token_ids = tokenizer.encode_with_bos(&corpus)?;
@@ -453,7 +449,11 @@ fn train_from_text_cpu(
         for step in 0..steps {
             let pair_idx = rng.gen_range(0..train_pairs.len());
             let (context_id, target_id) = train_pairs[pair_idx];
-            let lr = DEFAULT_LEARNING_RATE * lr_multiplier(step, steps);
+            let lr = DEFAULT_LEARNING_RATE * training::lr_multiplier_with_schedule(
+                step,
+                steps,
+                runtime.lr_schedule,
+            );
             let loss = model.train_step(context_id, target_id, lr);
             losses.push(loss);
             let step_idx = step + 1;
@@ -512,17 +512,13 @@ fn train_from_text_tch(
     text: &str,
     steps: usize,
     seed: u64,
-    model_kind: ModelKind,
     optimizer: Optimizer,
+    lr_schedule: LrSchedule,
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
     runtime: TensorTrainRuntime<'_>,
 ) -> Result<TrainMetrics, TensorError> {
-    if !matches!(model_kind, ModelKind::Bigram) {
-        return Err(TensorError::UnsupportedModelKind(model_kind));
-    }
-    ensure_tensor_optimizer_support(optimizer)?;
     let corpus = styled_corpus(text, style);
     let tokenizer = data::Tokenizer::from_text(&corpus);
     let token_ids = tokenizer.encode_with_bos(&corpus)?;
@@ -607,7 +603,8 @@ fn train_from_text_tch(
                 &target,
                 input_rmsnorm,
             );
-            let lr = DEFAULT_LEARNING_RATE * lr_multiplier(step, steps);
+            let lr = DEFAULT_LEARNING_RATE
+                * training::lr_multiplier_with_schedule(step, steps, lr_schedule);
             optimizer.set_lr(lr);
             let loss_value = loss.double_value(&[]);
             optimizer.backward_step(&loss);
@@ -682,6 +679,7 @@ fn train_from_text_tch_minigpt(
     steps: usize,
     seed: u64,
     optimizer: Optimizer,
+    lr_schedule: LrSchedule,
     style: Style,
     tie_lm_head: bool,
     input_rmsnorm: bool,
@@ -793,7 +791,8 @@ fn train_from_text_tch_minigpt(
                 &target,
                 input_rmsnorm,
             );
-            let lr = base_learning_rate * lr_multiplier(step, steps);
+            let lr = base_learning_rate
+                * training::lr_multiplier_with_schedule(step, steps, lr_schedule);
             optimizer.set_lr(lr);
             let loss_value = loss.double_value(&[]);
             optimizer.backward_step(&loss);
@@ -857,10 +856,7 @@ fn train_from_text_tch_minigpt(
 }
 
 #[cfg(feature = "tch-backend")]
-fn build_minigpt_windows(
-    token_ids: &[usize],
-    block_size: usize,
-) -> Vec<TensorMiniGptWindow> {
+fn build_minigpt_windows(token_ids: &[usize], block_size: usize) -> Vec<TensorMiniGptWindow> {
     if token_ids.len() < 2 {
         return Vec::new();
     }
@@ -891,11 +887,7 @@ fn tch_minigpt_forward_loss(
     input_rmsnorm: bool,
 ) -> Tensor {
     let window_len = context.size()[0];
-    let position_ids = Tensor::arange_start(
-        0,
-        window_len,
-        (Kind::Int64, context.device()),
-    );
+    let position_ids = Tensor::arange_start(0, window_len, (Kind::Int64, context.device()));
     let token_emb = token_embedding.index_select(0, context);
     let position_emb = position_embedding.index_select(0, &position_ids);
     let hidden = token_emb + position_emb;
@@ -907,12 +899,8 @@ fn tch_minigpt_forward_loss(
     } else {
         hidden
     };
-    let projection = match lm_head {
-        Some(matrix) => matrix,
-        None => token_embedding,
-    };
-    let logits = hidden.unsqueeze(0).matmul(&projection.transpose(0, 1));
-    logits
+    let projection = lm_head.unwrap_or(token_embedding);
+    hidden.unsqueeze(0).matmul(&projection.transpose(0, 1))
 }
 
 #[cfg(feature = "tch-backend")]
@@ -924,8 +912,14 @@ fn tch_minigpt_forward_loss_fn(
     target: &Tensor,
     input_rmsnorm: bool,
 ) -> Tensor {
-    tch_minigpt_forward_loss(token_embedding, lm_head, position_embedding, context, input_rmsnorm)
-        .cross_entropy_for_logits(target)
+    tch_minigpt_forward_loss(
+        token_embedding,
+        lm_head,
+        position_embedding,
+        context,
+        input_rmsnorm,
+    )
+    .cross_entropy_for_logits(target)
 }
 
 #[cfg(feature = "tch-backend")]
@@ -995,12 +989,10 @@ fn tch_forward_loss(
         hidden
     };
 
-    let projection = match lm_head {
-        Some(matrix) => matrix,
-        None => token_embedding,
-    };
-    let logits = hidden.matmul(&projection.transpose(0, 1));
-    logits.cross_entropy_for_logits(target)
+    let projection = lm_head.unwrap_or(token_embedding);
+    hidden
+        .matmul(&projection.transpose(0, 1))
+        .cross_entropy_for_logits(target)
 }
 
 #[cfg(feature = "tch-backend")]
@@ -1090,7 +1082,11 @@ fn sample_from_text_tch_minigpt(
 
     let mut generated = prompt.to_string();
     let mut context = vec![i64::try_from(tokenizer.bos_id()).expect("bos id fits i64")];
-    context.extend(prompt_ids.iter().map(|value| i64::try_from(*value).expect("token id fits i64")));
+    context.extend(
+        prompt_ids
+            .iter()
+            .map(|value| i64::try_from(*value).expect("token id fits i64")),
+    );
 
     for _ in 0..max_new_tokens {
         let start = context.len().saturating_sub(MINI_GPT_BLOCK_SIZE);
@@ -1316,6 +1312,7 @@ fn should_eval(step: usize, total_steps: usize, eval_every: usize) -> bool {
     training::should_eval(step, total_steps, eval_every)
 }
 
+#[cfg(test)]
 fn lr_multiplier(step: usize, total_steps: usize) -> f64 {
     training::lr_multiplier(step, total_steps)
 }
@@ -1355,19 +1352,14 @@ fn maybe_persist_checkpoint(
     }
     let payload = checkpoint_payload(step, loss, val_loss);
     let path = checkpoint_path(checkpoint_dir, backend, step);
-    persist_then_eval(
-        &path,
-        &payload,
-        |checkpoint_path| -> Result<(), Infallible> {
-            debug_assert!(checkpoint_path.exists());
-            Ok(())
-        },
-    )
+    persist_then_eval(&path, &payload, |p| -> Result<(), Infallible> {
+        debug_assert!(p.exists());
+        Ok(())
+    })
     .map_err(|err| match err {
         CheckpointEvalError::Io(io_err) => TensorError::Io(io_err),
-        CheckpointEvalError::Eval(infallible) => match infallible {},
-    })?;
-    Ok(())
+        CheckpointEvalError::Eval(never) => match never {},
+    })
 }
 
 fn build_pairs(token_ids: &[usize]) -> Result<Vec<TokenPair>, TensorError> {
@@ -1376,8 +1368,8 @@ fn build_pairs(token_ids: &[usize]) -> Result<Vec<TokenPair>, TensorError> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::env;
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1385,8 +1377,10 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
+    use crate::config::{
+        AppCommand, Mode, ModelKind, Optimizer, RuntimeConfig, SampleConfig, Style, TrainConfig,
+    };
     use crate::{cli, training};
-    use crate::config::{AppCommand, Mode, ModelKind, Optimizer, RuntimeConfig, SampleConfig, Style, TrainConfig};
 
     use super::{
         TensorBigram, TensorError, eval_pairs_slice, lr_multiplier, mean_nll_loss_cpu,
@@ -1443,10 +1437,7 @@ mod tests {
         config
     }
 
-    fn train_config(
-        model_kind: ModelKind,
-        optimizer: Optimizer,
-    ) -> TrainConfig {
+    fn train_config(model_kind: ModelKind, optimizer: Optimizer) -> TrainConfig {
         TrainConfig {
             runtime: RuntimeConfig {
                 mode: Mode::Tensor,
@@ -1456,6 +1447,7 @@ mod tests {
                 seed: 1,
             },
             optimizer,
+            lr_schedule: training::LrSchedule::Linear,
             tie_lm_head: true,
             input_rmsnorm: false,
             steps: 1,
@@ -1487,22 +1479,24 @@ mod tests {
             13,
             ModelKind::Bigram,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
         )
-            .expect("baseline metrics");
+        .expect("baseline metrics");
         let trained = train_from_text(
             "abababababababab",
             400,
             13,
             ModelKind::Bigram,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
         )
-            .expect("trained metrics");
+        .expect("trained metrics");
         assert!(trained.mean_loss_last_n < baseline.final_loss);
         assert!(trained.final_loss.is_finite());
     }
@@ -1613,9 +1607,8 @@ mod tests {
                     label,
                     model_kind,
                     expected,
-                } => expected.assert_error(
-                    super::sample(&sample_config(model_kind)).expect_err(label),
-                ),
+                } => expected
+                    .assert_error(super::sample(&sample_config(model_kind)).expect_err(label)),
             }
         }
     }
@@ -1663,9 +1656,8 @@ mod tests {
                         "--optimizer".to_string(),
                         optimizer.to_string(),
                     ]);
-                    expected.assert_error(
-                        super::train(&train_config_from_cli(args)).expect_err(label),
-                    );
+                    expected
+                        .assert_error(super::train(&train_config_from_cli(args)).expect_err(label));
                 }
                 CliRejectionCase::Sample {
                     label,
@@ -1772,6 +1764,7 @@ mod tests {
             0,
             ModelKind::Bigram,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
@@ -1791,13 +1784,16 @@ mod tests {
             1,
             ModelKind::Bigram,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
         )
         .expect("metrics should be produced for minimal text");
         assert_eq!(metrics.train_tokens, 1);
-        let val_loss = metrics.val_loss.expect("validation loss should be computed");
+        let val_loss = metrics
+            .val_loss
+            .expect("validation loss should be computed");
         assert!(val_loss.is_finite());
         assert!(metrics.final_loss.is_finite());
     }
@@ -1820,22 +1816,24 @@ mod tests {
             5,
             ModelKind::Bigram,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
         )
-            .expect("tied metrics");
+        .expect("tied metrics");
         let untied = train_from_text(
             "abababababababab",
             0,
             5,
             ModelKind::Bigram,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             false,
             false,
         )
-            .expect("untied metrics");
+        .expect("untied metrics");
         assert!(untied.parameter_count > tied.parameter_count);
     }
 
@@ -1847,11 +1845,12 @@ mod tests {
             5,
             ModelKind::Bigram,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
         )
-            .expect("metrics");
+        .expect("metrics");
         assert!(!metrics.backend.is_empty());
         assert!(!metrics.device.is_empty());
         if metrics.using_gpu {
@@ -1877,11 +1876,12 @@ mod tests {
             11,
             ModelKind::Bigram,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
         )
-            .expect("zero-step metrics");
+        .expect("zero-step metrics");
         assert_eq!(zero_step.steps_per_sec, 0.0);
         assert_eq!(zero_step.tokens_per_sec, 0.0);
 
@@ -1891,11 +1891,12 @@ mod tests {
             11,
             ModelKind::Bigram,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
         )
-            .expect("trained metrics");
+        .expect("trained metrics");
         assert!(trained.steps_per_sec.is_finite());
         assert!(trained.tokens_per_sec.is_finite());
         assert!(trained.steps_per_sec > 0.0);
@@ -1911,6 +1912,7 @@ mod tests {
             29,
             ModelKind::Bigram,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
@@ -1963,12 +1965,14 @@ mod tests {
             41,
             ModelKind::Bigram,
             Optimizer::Sgd,
+            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,
             super::TensorTrainRuntime {
                 checkpoint_every: 2,
                 checkpoint_dir: &checkpoint_dir,
+                lr_schedule: training::LrSchedule::Linear,
             },
         )
         .expect("training should succeed with checkpoints");
@@ -1983,15 +1987,9 @@ mod tests {
         let step_000004 = format!("tensor_{backend}_step_000004.ckpt");
         let step_000005 = format!("tensor_{backend}_step_000005.ckpt");
 
-        assert!(
-            checkpoint_dir.join(step_000002).exists()
-        );
-        assert!(
-            checkpoint_dir.join(step_000004).exists()
-        );
-        assert!(
-            checkpoint_dir.join(step_000005).exists()
-        );
+        assert!(checkpoint_dir.join(step_000002).exists());
+        assert!(checkpoint_dir.join(step_000004).exists());
+        assert!(checkpoint_dir.join(step_000005).exists());
 
         let _ = fs::remove_dir_all(&checkpoint_dir);
     }

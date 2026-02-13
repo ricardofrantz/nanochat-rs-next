@@ -1,9 +1,10 @@
 use std::fmt;
 
+pub use crate::config::LrSchedule;
 use crate::config::Style;
 use crate::data;
-use rand::rngs::StdRng;
 use rand::Rng;
+use rand::rngs::StdRng;
 
 pub const DEFAULT_CHECKPOINT_DIR: &str = "results/checkpoints";
 pub const VAL_FRACTION: f32 = 0.1;
@@ -133,6 +134,17 @@ pub fn should_eval(step: usize, total_steps: usize, eval_every: usize) -> bool {
 }
 
 pub fn lr_multiplier(step: usize, total_steps: usize) -> f64 {
+    lr_multiplier_with_schedule(step, total_steps, LrSchedule::Linear)
+}
+
+pub fn lr_multiplier_with_schedule(step: usize, total_steps: usize, schedule: LrSchedule) -> f64 {
+    match schedule {
+        LrSchedule::Linear => linear_lr_multiplier(step, total_steps),
+        LrSchedule::Sqrt => sqrt_lr_multiplier(step, total_steps),
+    }
+}
+
+fn linear_lr_multiplier(step: usize, total_steps: usize) -> f64 {
     if total_steps == 0 {
         return 1.0;
     }
@@ -146,6 +158,26 @@ pub fn lr_multiplier(step: usize, total_steps: usize) -> f64 {
     }
     let progress = (total_steps - step) as f64 / (warmdown_iters as f64);
     progress + (1.0 - progress) * FINAL_LR_FRAC
+}
+
+fn sqrt_lr_multiplier(step: usize, total_steps: usize) -> f64 {
+    if total_steps == 0 {
+        return 1.0;
+    }
+    let warmup_iters = (WARMUP_RATIO * (total_steps as f64)).round() as usize;
+    let warmdown_iters = (WARMDOWN_RATIO * (total_steps as f64)).round() as usize;
+
+    if warmup_iters > 0 && step < warmup_iters {
+        return (step + 1) as f64 / (warmup_iters as f64);
+    }
+    if warmdown_iters == 0 || step <= total_steps.saturating_sub(warmdown_iters) {
+        return 1.0;
+    }
+
+    let warmdown_start = total_steps.saturating_sub(warmdown_iters);
+    let progress = (step - warmdown_start) as f64 / (warmdown_iters as f64);
+    let decay = 1.0 - progress.sqrt();
+    decay + (1.0 - decay) * FINAL_LR_FRAC
 }
 
 pub fn eval_pairs_slice(pairs: &[(usize, usize)]) -> &[(usize, usize)] {

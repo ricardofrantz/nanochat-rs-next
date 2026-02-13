@@ -1,8 +1,8 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::training;
 use super::value::Value;
+use crate::training;
 
 const RMS_EPS: f64 = 1e-8;
 const LOG_EPS: f64 = 1e-12;

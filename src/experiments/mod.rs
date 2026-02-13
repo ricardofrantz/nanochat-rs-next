@@ -4,9 +4,11 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::{AblateConfig, ModelKind, Mode, Optimizer, RuntimeConfig, TrainConfig};
-use crate::training;
+use crate::config::{
+    AblateConfig, LrSchedule, Mode, ModelKind, Optimizer, RuntimeConfig, TrainConfig,
+};
 use crate::scalar::{self, TrainMetrics};
+use crate::training;
 
 #[derive(Debug, Clone, Copy)]
 struct AblationVariant {
@@ -197,6 +199,7 @@ pub fn run_ablation(config: &AblateConfig) -> Result<AblationReport, AblationErr
                 seed: config.seed,
             },
             optimizer: Optimizer::Sgd,
+            lr_schedule: LrSchedule::Linear,
             tie_lm_head: variant.tie_lm_head,
             input_rmsnorm: variant.input_rmsnorm,
             steps: config.steps,
