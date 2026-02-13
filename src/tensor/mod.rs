@@ -449,11 +449,8 @@ fn train_from_text_cpu(
         for step in 0..steps {
             let pair_idx = rng.gen_range(0..train_pairs.len());
             let (context_id, target_id) = train_pairs[pair_idx];
-            let lr = DEFAULT_LEARNING_RATE * training::lr_multiplier_with_schedule(
-                step,
-                steps,
-                runtime.lr_schedule,
-            );
+            let lr = DEFAULT_LEARNING_RATE
+                * training::lr_multiplier_with_schedule(step, steps, runtime.lr_schedule);
             let loss = model.train_step(context_id, target_id, lr);
             losses.push(loss);
             let step_idx = step + 1;
@@ -1965,7 +1962,6 @@ mod tests {
             41,
             ModelKind::Bigram,
             Optimizer::Sgd,
-            training::LrSchedule::Linear,
             Style::Classic,
             true,
             false,

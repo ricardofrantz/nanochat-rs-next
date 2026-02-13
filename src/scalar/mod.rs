@@ -386,6 +386,7 @@ fn build_pairs(token_ids: &[usize]) -> Result<Vec<TokenPair>, ScalarError> {
 #[cfg(test)]
 mod tests {
     use crate::config::{Optimizer, Style};
+    use crate::training;
 
     use super::{ScalarError, lr_multiplier, sample_from_text, train_from_text};
 

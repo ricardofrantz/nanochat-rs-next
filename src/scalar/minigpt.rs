@@ -496,6 +496,7 @@ fn sum_values(values: &[Value]) -> Value {
 #[cfg(test)]
 mod tests {
     use crate::config::{Optimizer, Style};
+    use crate::training;
 
     use super::{MINI_GPT_BLOCK_SIZE, ScalarError, sample_from_text, train_from_text};
 
