@@ -7,6 +7,9 @@ set -euo pipefail
 #   bash scripts/colab_gpu_benchmark.sh
 #   PROFILE=full BASELINE=nanochat bash scripts/colab_gpu_benchmark.sh
 #   BASELINE=nanochat EXTRA_ARGS="--nanochat-num-iterations 30" bash scripts/colab_gpu_benchmark.sh
+#   BASELINE_MODE=skip BASELINE=nanochat bash scripts/colab_gpu_benchmark.sh
+#   SKIP_NANOCHAT_BASELINE=1 BASELINE=nanochat bash scripts/colab_gpu_benchmark.sh
+#   COLAB_DRY_RUN=1 BASELINE_MODE=skip BASELINE=nanochat bash scripts/colab_gpu_benchmark.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -14,7 +17,11 @@ cd "${REPO_ROOT}"
 
 BASELINE="${BASELINE:-nanochat}"
 PROFILE="${PROFILE:-auto}" # auto|quick|full
+BASELINE_MODE="${BASELINE_MODE:-run}" # run|skip
+SKIP_NANOCHAT_BASELINE="${SKIP_NANOCHAT_BASELINE:-0}" # 1|0
+COLAB_DRY_RUN="${COLAB_DRY_RUN:-0}" # 1|0
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+NANOCHAT_TRAIN_TIMEOUT_SEC="${NANOCHAT_TRAIN_TIMEOUT_SEC:-0}"
 TORCH_PIP_INDEX_URL="${TORCH_PIP_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 TORCH_PIP_FALLBACK_INDEX_URL="${TORCH_PIP_FALLBACK_INDEX_URL:-https://download.pytorch.org/whl/cu126}"
 OURS_CARGO_FEATURES="${OURS_CARGO_FEATURES:-tch-backend}"
@@ -28,40 +35,69 @@ if [[ "${BASELINE}" != "nanochat" ]]; then
   exit 1
 fi
 
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "GPU runtime required. In Colab: Runtime -> Change runtime type -> GPU."
+if [[ "${BASELINE_MODE}" != "run" && "${BASELINE_MODE}" != "skip" ]]; then
+  echo "BASELINE_MODE must be 'run' or 'skip'."
   exit 1
 fi
 
-if ! command -v rustup >/dev/null 2>&1; then
-  curl -LsSf https://sh.rustup.rs | sh -s -- -y
+if [[ "${COLAB_DRY_RUN}" != "0" && "${COLAB_DRY_RUN}" != "1" ]]; then
+  echo "COLAB_DRY_RUN must be '0' or '1'."
+  exit 1
 fi
 
-source "${HOME}/.cargo/env"
-rustup toolchain install stable --profile minimal
-rustup default stable
-
-python3 --version
-cargo --version
-nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
-
-export LIBTORCH_USE_PYTORCH=1
-export LIBTORCH_BYPASS_VERSION_CHECK=1
-
-if [[ "${RUN_DOCTOR}" == "1" ]]; then
-  REQUIRE_GPU="${REQUIRE_GPU}" bash scripts/nvidia_doctor.sh
+if [[ "${SKIP_NANOCHAT_BASELINE}" == "1" && "${BASELINE_MODE}" == "run" ]]; then
+  BASELINE_MODE="skip"
+  echo "COLAB_DRY_RUN: SKIP_NANOCHAT_BASELINE=1 is deprecated; using BASELINE_MODE=skip."
+elif [[ "${SKIP_NANOCHAT_BASELINE}" == "1" ]]; then
+  echo "COLAB_DRY_RUN: SKIP_NANOCHAT_BASELINE=1 is ignored because BASELINE_MODE already equals skip."
 fi
 
 if [[ "${PROFILE}" == "auto" ]]; then
-  GPU_MEM_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n1 | tr -d '[:space:]')"
-  if [[ "${GPU_MEM_MB}" =~ ^[0-9]+$ ]] && (( GPU_MEM_MB >= 30000 )); then
-    PROFILE="full"
-  else
+  if [[ "${COLAB_DRY_RUN}" == "1" ]]; then
+    echo "COLAB_DRY_RUN: PROFILE=auto requested; defaulting PROFILE=quick for command preview."
     PROFILE="quick"
+  else
+    GPU_MEM_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n1 | tr -d '[:space:]')"
+    if [[ "${GPU_MEM_MB}" =~ ^[0-9]+$ ]] && (( GPU_MEM_MB >= 30000 )); then
+      PROFILE="full"
+    else
+      PROFILE="quick"
+    fi
+  fi
+fi
+
+if [[ "${COLAB_DRY_RUN}" == "1" ]]; then
+  echo "COLAB_DRY_RUN enabled: command preview only; skipping environment setup and execution."
+fi
+
+if [[ "${COLAB_DRY_RUN}" != "1" ]]; then
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "GPU runtime required. In Colab: Runtime -> Change runtime type -> GPU."
+    exit 1
+  fi
+
+  if ! command -v rustup >/dev/null 2>&1; then
+    curl -LsSf https://sh.rustup.rs | sh -s -- -y
+  fi
+
+  source "${HOME}/.cargo/env"
+  rustup toolchain install stable --profile minimal
+  rustup default stable
+
+  python3 --version
+  cargo --version
+  nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+
+  export LIBTORCH_USE_PYTORCH=1
+  export LIBTORCH_BYPASS_VERSION_CHECK=1
+
+  if [[ "${RUN_DOCTOR}" == "1" ]]; then
+    REQUIRE_GPU="${REQUIRE_GPU}" bash scripts/nvidia_doctor.sh
   fi
 fi
 
 echo "Using PROFILE=${PROFILE} BASELINE=${BASELINE} NANOCHAT_REF=${NANOCHAT_REF} NANOCHAT_DEVICE_TYPE=${NANOCHAT_DEVICE_TYPE}"
+echo "Using BASELINE_MODE=${BASELINE_MODE} NANOCHAT_TRAIN_TIMEOUT_SEC=${NANOCHAT_TRAIN_TIMEOUT_SEC}"
 
 ARGS=(
   --baseline "${BASELINE}"
@@ -69,9 +105,15 @@ ARGS=(
   --ours-cargo-features "${OURS_CARGO_FEATURES}"
   --nanochat-ref "${NANOCHAT_REF}"
   --nanochat-device-type "${NANOCHAT_DEVICE_TYPE}"
+  --baseline-mode "${BASELINE_MODE}"
   --torch-pip-index-url "${TORCH_PIP_INDEX_URL}"
   --torch-pip-fallback-index-url "${TORCH_PIP_FALLBACK_INDEX_URL}"
+  --nanochat-train-timeout-sec "${NANOCHAT_TRAIN_TIMEOUT_SEC}"
 )
+
+if [[ "${SKIP_NANOCHAT_BASELINE}" == "1" ]]; then
+  ARGS+=(--skip-nanochat-baseline)
+fi
 
 if [[ "${REQUIRE_GPU}" == "1" ]]; then
   ARGS+=(--require-gpu)
@@ -100,6 +142,20 @@ if [[ -n "${EXTRA_ARGS}" ]]; then
   # shellcheck disable=SC2206
   EXTRA_ARR=(${EXTRA_ARGS})
   ARGS+=("${EXTRA_ARR[@]}")
+fi
+
+if [[ "${COLAB_DRY_RUN}" == "1" ]]; then
+  echo "Command preview (COLAB_DRY_RUN=1):"
+  printf '  %q' "${ARGS[@]}"
+  echo
+  exit 0
+fi
+
+# Keep explicit command logging in live execution for reproducibility.
+if [[ "${COLAB_DRY_RUN}" != "1" ]]; then
+  echo "benchmark command:"
+  printf '  %q' "${ARGS[@]}"
+  echo
 fi
 
 python3 scripts/benchmark_karpathy.py "${ARGS[@]}"

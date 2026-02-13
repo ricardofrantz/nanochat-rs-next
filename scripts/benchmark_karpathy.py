@@ -10,6 +10,9 @@ Outputs:
 Usage:
   python3 scripts/benchmark_karpathy.py --baseline nanochat --install-deps
   python3 scripts/benchmark_karpathy.py --baseline nanochat --install-deps --run-ours-scalar-fallback
+  python3 scripts/benchmark_karpathy.py --baseline nanochat --install-deps --baseline-mode skip
+  python3 scripts/benchmark_karpathy.py --baseline nanochat --install-deps --nanochat-num-iterations 1 --nanochat-max-chars 200 --nanochat-train-timeout-sec 180
+  python3 scripts/benchmark_karpathy.py --baseline nanochat --baseline-mode skip --baseline-skip-context preflight --print-command
 """
 
 from __future__ import annotations
@@ -590,6 +593,34 @@ def run_nanochat(args: argparse.Namespace, log_dir: pathlib.Path, nanochat_repo:
     }
 
 
+def make_skipped_nanochat_result(
+    reason: str,
+    *,
+    skip_context: str = "manual",
+    skip_requested_by: str = "user",
+    skip_requested_via_alias: bool = False,
+    timeout_sec: float | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": "skipped",
+        "returncode": 0,
+        "elapsed_sec": 0.0,
+        "timed_out": False,
+        "timeout_sec": timeout_sec,
+        "skip_reason": reason,
+        "skip_context": skip_context,
+        "skip_requested_by": skip_requested_by,
+        "skip_requested_at_utc": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "skip_requested_via_alias": skip_requested_via_alias,
+        "commit": None,
+        "steps_tail": [],
+        "last_step": None,
+        "eval_rows": [],
+        "last_eval": None,
+        "min_val_bpb": None,
+    }
+
+
 def render_markdown(summary: dict[str, Any]) -> str:
     lines: list[str] = []
     lines.append("# Benchmark Summary")
@@ -614,6 +645,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
         else:
             lines.append(f"- Python torch: `unavailable error={pt.get('error')}`")
     lines.append(f"- Baseline mode: `{summary['args']['baseline']}`")
+    if "baseline_mode" in summary["args"]:
+        lines.append(f"- Baseline run mode: `{summary['args']['baseline_mode']}`")
     lines.append("")
 
     ours = summary["runs"]["ours_tensor"]
@@ -665,9 +698,20 @@ def render_markdown(summary: dict[str, Any]) -> str:
         lines.append("## nanochat")
         lines.append("")
         lines.append(f"- Status: `{nanochat['status']}`")
+        if nanochat.get("skip_reason"):
+            lines.append(f"- Reason: `{nanochat['skip_reason']}`")
+        if nanochat.get("skip_context"):
+            lines.append(f"- Skip context: `{nanochat['skip_context']}`")
+        if nanochat.get("skip_requested_by"):
+            lines.append(f"- Skip requested by: `{nanochat['skip_requested_by']}`")
+        if nanochat.get("skip_requested_at_utc"):
+            lines.append(f"- Skip requested at (UTC): `{nanochat['skip_requested_at_utc']}`")
+        if nanochat.get("skip_requested_via_alias"):
+            lines.append("- Skip requested via: `legacy alias`")
         if nanochat.get("timed_out"):
             lines.append(f"- Timeout: `{nanochat.get('timeout_sec')}s`")
-        lines.append(f"- Commit: `{nanochat['commit']}`")
+        if nanochat.get("commit"):
+            lines.append(f"- Commit: `{nanochat['commit']}`")
         lines.append(f"- Elapsed: `{nanochat['elapsed_sec']:.3f}s`")
         if nanochat.get("last_eval"):
             lines.append(
@@ -742,7 +786,41 @@ def parse_args() -> argparse.Namespace:
         help="timeout for nanochat base_train command; <=0 disables timeout",
     )
     parser.add_argument("--nanochat-num-iterations", type=int, default=60)
+    parser.add_argument(
+        "--baseline-mode",
+        choices=["run", "skip"],
+        default="run",
+        help="control how baseline nanochat run is handled: run or skip",
+    )
+    parser.add_argument(
+        "--skip-nanochat-baseline",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="skip nanochat baseline run and mark it as skipped in outputs",
+    )
+    parser.add_argument(
+        "--baseline-skip-context",
+        type=str,
+        default="manual",
+        help="metadata tag for why baseline was skipped",
+    )
+    parser.add_argument(
+        "--baseline-skip-requested-by",
+        type=str,
+        default="user",
+        help="requesting actor label stored in skipped baseline output",
+    )
+    parser.add_argument(
+        "--print-command",
+        action="store_true",
+        help="print the planned benchmark flow and exit without executing",
+    )
     args = parser.parse_args()
+    if args.skip_nanochat_baseline:
+        args.baseline_skip_context = "legacy-alias"
+        if args.baseline_skip_requested_by == "user":
+            args.baseline_skip_requested_by = "legacy-cli-flag"
+        args.baseline_mode = "skip"
     if args.nanochat_train_timeout_sec <= 0:
         args.nanochat_train_timeout_sec = None
     return args
@@ -755,15 +833,37 @@ def main() -> int:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_name = f"benchmark_karpathy_{stamp}"
     logs_dir = RESULTS_DIR / f"{run_name}_logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-
-    gpu_info = query_gpu_info(args.require_gpu)
 
     ours_data_path = pathlib.Path(args.ours_data)
     if not ours_data_path.is_absolute():
         ours_data_path = (REPO_ROOT / ours_data_path).resolve()
-    if not ours_data_path.exists():
-        raise RuntimeError(f"ours dataset path does not exist: {ours_data_path}")
+    if args.print_command:
+        print("benchmark_karpathy.py dry-run mode: no benchmark commands will be executed.")
+        print(f"run_name={run_name}")
+        print(f"ours_data_path={ours_data_path}")
+        print(f"require_gpu={args.require_gpu}")
+        print(f"baseline_mode={args.baseline_mode}")
+        print(f"baseline_skip_context={args.baseline_skip_context}")
+        print(f"baseline_skip_requested_by={args.baseline_skip_requested_by}")
+        print("planned_runs:")
+        print(
+            "- ours_tensor: dataset tensor-mode run with args "
+            f"--ours-steps={args.ours_steps} --ours-cargo-features={args.ours_cargo_features}"
+        )
+        if args.run_ours_scalar_fallback:
+            print("- ours_scalar: scalar fallback run enabled")
+        if args.baseline == "nanochat":
+            if args.baseline_mode == "skip":
+                print(
+                    "- nanochat: skipped "
+                    f"because '{args.baseline_skip_context}:{args.baseline_skip_requested_by}'"
+                )
+            else:
+                print("- nanochat: full baseline training will be executed")
+        print(f"artifact_json={RESULTS_DIR / f'benchmark_karpathy_{stamp}.json'}")
+        print(f"artifact_md={RESULTS_DIR / f'benchmark_karpathy_{stamp}.md'}")
+        print(f"artifact_logs_dir={logs_dir}")
+        return 0
 
     summary: dict[str, Any] = {
         "timestamp_utc": stamp,
@@ -771,11 +871,14 @@ def main() -> int:
         "ours_data_path": str(ours_data_path),
         "ours_gpu_backend": detect_requested_gpu_backend(args.ours_cargo_features),
         "ours_repo_gpu_backend": detect_repo_gpu_backend(),
-        "gpu": gpu_info,
+        "gpu": query_gpu_info(args.require_gpu),
         "args": vars(args),
         "resolved_refs": {},
         "runs": {},
     }
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    if not ours_data_path.exists():
+        raise RuntimeError(f"ours dataset path does not exist: {ours_data_path}")
 
     ours_features = parse_ours_features(args.ours_cargo_features)
     needs_torch_runtime = args.require_gpu or ("tch-backend" in ours_features)
@@ -796,14 +899,23 @@ def main() -> int:
         summary["runs"]["ours_scalar"] = run_ours_scalar(args, logs_dir, ours_data_path)
 
     if args.baseline == "nanochat":
-        nanochat_repo, nanochat_resolved_ref = ensure_repo(
-            "https://github.com/karpathy/nanochat",
-            "nanochat",
-            args.nanochat_ref,
-            logs_dir,
-        )
-        summary["resolved_refs"]["nanochat"] = nanochat_resolved_ref
-        summary["runs"]["nanochat"] = run_nanochat(args, logs_dir, nanochat_repo)
+        if args.baseline_mode == "skip":
+            summary["runs"]["nanochat"] = make_skipped_nanochat_result(
+                "baseline intentionally skipped on constrained machine",
+                skip_context=args.baseline_skip_context,
+                skip_requested_by=args.baseline_skip_requested_by,
+                skip_requested_via_alias=args.skip_nanochat_baseline,
+                timeout_sec=args.nanochat_train_timeout_sec,
+            )
+        else:
+            nanochat_repo, nanochat_resolved_ref = ensure_repo(
+                "https://github.com/karpathy/nanochat",
+                "nanochat",
+                args.nanochat_ref,
+                logs_dir,
+            )
+            summary["resolved_refs"]["nanochat"] = nanochat_resolved_ref
+            summary["runs"]["nanochat"] = run_nanochat(args, logs_dir, nanochat_repo)
 
     json_path = RESULTS_DIR / f"{run_name}.json"
     md_path = RESULTS_DIR / f"{run_name}.md"

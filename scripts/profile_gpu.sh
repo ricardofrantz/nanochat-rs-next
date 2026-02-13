@@ -7,6 +7,9 @@ set -euo pipefail
 #   bash scripts/profile_gpu.sh
 #   REQUIRE_GPU=0 OURS_CARGO_FEATURES="" NANOCHAT_DEVICE_TYPE=cpu bash scripts/profile_gpu.sh
 #   EXTRA_BENCH_ARGS="--nanochat-num-iterations 30 --nanochat-eval-every 10" bash scripts/profile_gpu.sh
+#   BASELINE_MODE=skip bash scripts/profile_gpu.sh
+#   NANOCHAT_TRAIN_TIMEOUT_SEC=0 bash scripts/profile_gpu.sh
+#   DRY_RUN=1 BASELINE_MODE=skip bash scripts/profile_gpu.sh
 #
 # Artifacts:
 #   results/gpu_profile_<timestamp>/run.log
@@ -28,6 +31,8 @@ NANOCHAT_DEVICE_TYPE="${NANOCHAT_DEVICE_TYPE:-cuda}"
 NANOCHAT_NUM_ITERATIONS="${NANOCHAT_NUM_ITERATIONS:-60}"
 NANOCHAT_TRAIN_TIMEOUT_SEC="${NANOCHAT_TRAIN_TIMEOUT_SEC:-900}"
 NANOCHAT_DISABLE_COMPILE="${NANOCHAT_DISABLE_COMPILE:-0}" # 1|0
+BASELINE_MODE="${BASELINE_MODE:-run}" # run|skip
+DRY_RUN="${DRY_RUN:-0}" # 1|0
 EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
 
 if [[ "${BASELINE}" != "nanochat" ]]; then
@@ -35,28 +40,20 @@ if [[ "${BASELINE}" != "nanochat" ]]; then
   exit 1
 fi
 
-if [[ "${REQUIRE_GPU}" == "1" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "profile_gpu: nvidia-smi not found and REQUIRE_GPU=1."
+if [[ "${BASELINE_MODE}" != "run" && "${BASELINE_MODE}" != "skip" ]]; then
+  echo "profile_gpu: BASELINE_MODE must be 'run' or 'skip'."
   exit 1
 fi
 
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-RUN_DIR="results/gpu_profile_${STAMP}"
-mkdir -p "${RUN_DIR}"
+if [[ "${DRY_RUN}" != "0" && "${DRY_RUN}" != "1" ]]; then
+  echo "profile_gpu: DRY_RUN must be '0' or '1'."
+  exit 1
+fi
 
-RUN_LOG="${RUN_DIR}/run.log"
-SUMMARY_TXT="${RUN_DIR}/summary.txt"
-NVIDIA_PRE="${RUN_DIR}/nvidia_smi_pre.txt"
-NVIDIA_POST="${RUN_DIR}/nvidia_smi_post.txt"
-
-capture_gpu_snapshot() {
-  local output_file="$1"
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi --query-gpu=timestamp,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader >"${output_file}" || true
-  fi
-}
-
-capture_gpu_snapshot "${NVIDIA_PRE}"
+if [[ "${DRY_RUN}" != "1" ]] && [[ "${REQUIRE_GPU}" == "1" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "profile_gpu: nvidia-smi not found and REQUIRE_GPU=1."
+  exit 1
+fi
 
 BENCH_CMD=(
   python3 scripts/benchmark_karpathy.py
@@ -68,6 +65,7 @@ BENCH_CMD=(
   --nanochat-device-type "${NANOCHAT_DEVICE_TYPE}"
   --nanochat-num-iterations "${NANOCHAT_NUM_ITERATIONS}"
   --nanochat-train-timeout-sec "${NANOCHAT_TRAIN_TIMEOUT_SEC}"
+  --baseline-mode "${BASELINE_MODE}"
 )
 
 if [[ "${REQUIRE_GPU}" == "1" ]]; then
@@ -89,6 +87,39 @@ if [[ -n "${EXTRA_BENCH_ARGS}" ]]; then
   EXTRA_ARR=(${EXTRA_BENCH_ARGS})
   BENCH_CMD+=("${EXTRA_ARR[@]}")
 fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+  RUN_DIR="results/gpu_profile_${STAMP}"
+  RUN_LOG="${RUN_DIR}/run.log"
+  SUMMARY_TXT="${RUN_DIR}/summary.txt"
+  NVIDIA_PRE="${RUN_DIR}/nvidia_smi_pre.txt"
+  NVIDIA_POST="${RUN_DIR}/nvidia_smi_post.txt"
+  echo "profile_gpu: dry-run command preview (DRY_RUN=1)"
+  echo "profile_gpu: would write artifacts under ${RUN_DIR}"
+  echo "profile_gpu: running benchmark command:"
+  printf '  %q' "${BENCH_CMD[@]}"
+  echo
+  exit 0
+fi
+
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_DIR="results/gpu_profile_${STAMP}"
+mkdir -p "${RUN_DIR}"
+
+RUN_LOG="${RUN_DIR}/run.log"
+SUMMARY_TXT="${RUN_DIR}/summary.txt"
+NVIDIA_PRE="${RUN_DIR}/nvidia_smi_pre.txt"
+NVIDIA_POST="${RUN_DIR}/nvidia_smi_post.txt"
+
+capture_gpu_snapshot() {
+  local output_file="$1"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=timestamp,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader >"${output_file}" || true
+  fi
+}
+
+capture_gpu_snapshot "${NVIDIA_PRE}"
 
 echo "profile_gpu: writing artifacts under ${RUN_DIR}"
 echo "profile_gpu: running benchmark command:"
